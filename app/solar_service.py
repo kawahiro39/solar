@@ -21,6 +21,9 @@ from .panel_layout import (
 from .schemas import SolarDesignRequest
 
 
+EARTH_RADIUS_M = 6_378_137.0
+
+
 class SolarApiError(Exception):
     def __init__(self, status_code: int, message: str) -> None:
         super().__init__(message)
@@ -87,7 +90,7 @@ class SolarDesignEngine:
             polygon_vertices = segment.get("segmentPolygon", {}).get("vertices", [])
             if len(polygon_vertices) < 3:
                 continue
-            coords = [(float(v.get("x", 0.0)), float(v.get("y", 0.0))) for v in polygon_vertices]
+            coords = _convert_vertices_to_meters(polygon_vertices)
             # Ensure the polygon closes correctly
             if coords[0] != coords[-1]:
                 coords.append(coords[0])
@@ -197,13 +200,36 @@ def _parse_map_url(url: str) -> Optional[Tuple[float, float]]:
         match = re.search(r"/place/(-?\d+\.\d+),(-?\d+\.\d+)", url)
         if match:
             return float(match.group(1)), float(match.group(2))
-
     matches = [float(value) for value in _FLOAT_PAIR_RE.findall(url)]
     for i in range(len(matches) - 1):
         lat, lng = matches[i], matches[i + 1]
         if -90 <= lat <= 90 and -180 <= lng <= 180:
             return lat, lng
     return None
+
+
+def _convert_vertices_to_meters(vertices: Sequence[Dict[str, object]]) -> List[Tuple[float, float]]:
+    if not vertices:
+        return []
+    coords_deg: List[Tuple[float, float]] = []
+    for vertex in vertices:
+        lon = float(vertex.get("x", 0.0))
+        lat = float(vertex.get("y", 0.0))
+        coords_deg.append((lon, lat))
+
+    ref_lon_deg, ref_lat_deg = coords_deg[0]
+    ref_lat_rad = math.radians(ref_lat_deg)
+    ref_lon_rad = math.radians(ref_lon_deg)
+    cos_lat = math.cos(ref_lat_rad)
+
+    coords_m: List[Tuple[float, float]] = []
+    for lon_deg, lat_deg in coords_deg:
+        lon_rad = math.radians(lon_deg)
+        lat_rad = math.radians(lat_deg)
+        x = (lon_rad - ref_lon_rad) * cos_lat * EARTH_RADIUS_M
+        y = (lat_rad - ref_lat_rad) * EARTH_RADIUS_M
+        coords_m.append((x, y))
+    return coords_m
 
 
 def _get_api_key() -> str:
@@ -213,3 +239,4 @@ def _get_api_key() -> str:
             "GOOGLE_API_KEY environment variable is not set. Cloud Run 環境変数または Secret Manager を設定してください。"
         )
     return api_key
+
