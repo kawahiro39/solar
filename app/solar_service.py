@@ -86,11 +86,18 @@ class SolarDesignEngine:
     def build_segments(self, solar_data: Dict[str, object]) -> List[SegmentInput]:
         segments_data = solar_data.get("solarPotential", {}).get("roofSegments", [])
         segments: List[SegmentInput] = []
+        reference_lon_lat: Optional[Tuple[float, float]] = None
         for index, segment in enumerate(segments_data):
             polygon_vertices = segment.get("segmentPolygon", {}).get("vertices", [])
             if len(polygon_vertices) < 3:
                 continue
-            coords = _convert_vertices_to_meters(polygon_vertices)
+            if reference_lon_lat is None and polygon_vertices:
+                first_vertex = polygon_vertices[0]
+                reference_lon_lat = (
+                    float(first_vertex.get("x", 0.0)),
+                    float(first_vertex.get("y", 0.0)),
+                )
+            coords = _convert_vertices_to_meters(polygon_vertices, reference_lon_lat)
             # Ensure the polygon closes correctly
             if coords[0] != coords[-1]:
                 coords.append(coords[0])
@@ -208,7 +215,10 @@ def _parse_map_url(url: str) -> Optional[Tuple[float, float]]:
     return None
 
 
-def _convert_vertices_to_meters(vertices: Sequence[Dict[str, object]]) -> List[Tuple[float, float]]:
+def _convert_vertices_to_meters(
+    vertices: Sequence[Dict[str, object]],
+    reference_lon_lat: Optional[Tuple[float, float]] = None,
+) -> List[Tuple[float, float]]:
     if not vertices:
         return []
     coords_deg: List[Tuple[float, float]] = []
@@ -217,7 +227,10 @@ def _convert_vertices_to_meters(vertices: Sequence[Dict[str, object]]) -> List[T
         lat = float(vertex.get("y", 0.0))
         coords_deg.append((lon, lat))
 
-    ref_lon_deg, ref_lat_deg = coords_deg[0]
+    if reference_lon_lat is None:
+        ref_lon_deg, ref_lat_deg = coords_deg[0]
+    else:
+        ref_lon_deg, ref_lat_deg = reference_lon_lat
     ref_lat_rad = math.radians(ref_lat_deg)
     ref_lon_rad = math.radians(ref_lon_deg)
     cos_lat = math.cos(ref_lat_rad)
