@@ -56,6 +56,15 @@ def render_layout(
 
     image = Image.new("RGB", (img_width, img_height), (242, 244, 248))
 
+    draw_width = base_width
+    draw_height = base_height if base_height > 0 else 1
+
+    def project(point: Tuple[float, float]) -> Tuple[float, float]:
+        x, y = point
+        px = ((x - minx) / width_m) * draw_width + margin_px
+        py = margin_px + draw_height - ((y - miny) / height_m) * draw_height
+        return px, py
+
     if background is not None and background_bounds is not None:
         bminx, bminy, bmaxx, bmaxy = background_bounds
         top_left = project((bminx, bmaxy))
@@ -70,15 +79,6 @@ def render_layout(
         image.paste(resized, (int(math.floor(left_px)), int(math.floor(top_px))))
 
     draw = ImageDraw.Draw(image, "RGBA")
-
-    draw_width = base_width
-    draw_height = base_height if base_height > 0 else 1
-
-    def project(point: Tuple[float, float]) -> Tuple[float, float]:
-        x, y = point
-        px = ((x - minx) / width_m) * draw_width + margin_px
-        py = margin_px + draw_height - ((y - miny) / height_m) * draw_height
-        return px, py
 
     roof_color = (178, 205, 251, 200)
     roof_outline = (64, 112, 214, 255)
