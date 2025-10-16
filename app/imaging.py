@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import base64
 import io
+import math
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw
 from shapely.geometry import Polygon
@@ -24,6 +25,8 @@ def render_layout(
     placements: Iterable[PanelPlacement],
     specs: Sequence[PanelSpec],
     image_size: int = 900,
+    background: Optional[Image.Image] = None,
+    background_bounds: Optional[Tuple[float, float, float, float]] = None,
 ) -> str:
     placement_polygons: List[Polygon] = [placement.polygon for placement in placements]
     all_geometries: List[Polygon] = list(roof_polygons) + placement_polygons
@@ -34,6 +37,12 @@ def render_layout(
     miny = min(poly.bounds[1] for poly in all_geometries)
     maxx = max(poly.bounds[2] for poly in all_geometries)
     maxy = max(poly.bounds[3] for poly in all_geometries)
+    if background is not None and background_bounds is not None:
+        bminx, bminy, bmaxx, bmaxy = background_bounds
+        minx = min(minx, bminx)
+        miny = min(miny, bminy)
+        maxx = max(maxx, bmaxx)
+        maxy = max(maxy, bmaxy)
 
     width_m = max(maxx - minx, 1e-6)
     height_m = max(maxy - miny, 1e-6)
@@ -46,6 +55,20 @@ def render_layout(
     img_height = base_height + margin_px * 2
 
     image = Image.new("RGB", (img_width, img_height), (242, 244, 248))
+
+    if background is not None and background_bounds is not None:
+        bminx, bminy, bmaxx, bmaxy = background_bounds
+        top_left = project((bminx, bmaxy))
+        bottom_right = project((bmaxx, bminy))
+        left_px = min(top_left[0], bottom_right[0])
+        right_px = max(top_left[0], bottom_right[0])
+        top_px = min(top_left[1], bottom_right[1])
+        bottom_px = max(top_left[1], bottom_right[1])
+        width_px = max(int(math.ceil(right_px - left_px)), 1)
+        height_px = max(int(math.ceil(bottom_px - top_px)), 1)
+        resized = background.resize((width_px, height_px))
+        image.paste(resized, (int(math.floor(left_px)), int(math.floor(top_px))))
+
     draw = ImageDraw.Draw(image, "RGBA")
 
     draw_width = base_width

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from shapely.geometry import Polygon
@@ -14,7 +14,7 @@ from .schemas import (
     SolarDesignRequest,
     SolarDesignResponse,
 )
-from .solar_service import SolarApiError, SolarDesignEngine
+from .solar_service import DataLayerRenderContext, SolarApiError, SolarDesignEngine
 
 app = FastAPI(title="Solar Design Service", version="1.0.0")
 
@@ -33,10 +33,35 @@ def design_solar_system(request: SolarDesignRequest) -> SolarDesignResponse:
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
+    specs = engine.build_specs()
+    use_data_layers = request.force_data_layers
+    solar_data: Dict[str, object] = {}
+    data_layers_payload: Optional[Dict[str, object]] = None
+    render_context: Optional[DataLayerRenderContext] = None
+
+    segments = []
+    if not use_data_layers:
+        try:
+            solar_data = engine.fetch_building_insights(lat, lng)
+            segments = engine.build_segments(solar_data)
+        except SolarApiError as exc:
+            if exc.status_code == 404:
+                use_data_layers = True
+                solar_data = {}
+            else:
+                raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+    if use_data_layers:
+        try:
+            data_layers_payload = engine.fetch_data_layers(lat, lng)
+            segments, render_context = engine.build_segments_from_data_layers(lat, lng, data_layers_payload)
+        except SolarApiError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+    if not segments:
+        raise HTTPException(status_code=404, detail="屋根ポリゴン情報が取得できませんでした。別の建物でお試しください。")
+
     try:
-        solar_data = engine.fetch_building_insights(lat, lng)
-        specs = engine.build_specs()
-        segments = engine.build_segments(solar_data)
         orientation, placements, mix, face_mix, face_limits = engine.compute_layout(segments, specs)
     except SolarApiError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
@@ -47,7 +72,15 @@ def design_solar_system(request: SolarDesignRequest) -> SolarDesignResponse:
     dc_kw = round(total_watts / 1000.0, 3)
 
     roof_polygons: List[Polygon] = [segment.polygon for segment in segments]
-    image_b64 = render_layout(roof_polygons, placements, specs)
+    background_image = render_context.background if render_context else None
+    background_bounds = render_context.bounds_m if render_context else None
+    image_b64 = render_layout(
+        roof_polygons,
+        placements,
+        specs,
+        background=background_image,
+        background_bounds=background_bounds,
+    )
 
     mix_entries = [
         PanelMixEntry(spec=PanelSpecInput(**spec.original), count=mix[spec.index])
@@ -76,8 +109,8 @@ def design_solar_system(request: SolarDesignRequest) -> SolarDesignResponse:
     total_panel_area = sum(specs[idx].width_m * specs[idx].height_m * count for idx, count in mix.items())
     fill_rate = 0.0 if total_roof_area == 0 else round(total_panel_area / total_roof_area, 3)
 
-    solar_potential = solar_data.get("solarPotential", {})
-    max_orientation = solar_potential.get("maxSunshineOrientation", {})
+    solar_potential = solar_data.get("solarPotential") if solar_data else None
+    max_orientation = solar_potential.get("maxSunshineOrientation", {}) if solar_potential else {}
     site_info = {
         "lat": lat,
         "lng": lng,
@@ -85,10 +118,9 @@ def design_solar_system(request: SolarDesignRequest) -> SolarDesignResponse:
         "tilt_deg": max_orientation.get("tiltDegrees"),
     }
 
-    return SolarDesignResponse(
-        site=site_info,
-        solar_potential=solar_potential,
-        result={
+    response_payload: Dict[str, object] = {
+        "site": site_info,
+        "result": {
             "orientation_used": orientation,
             "dc_kw": dc_kw,
             "mix": mix_entries,
@@ -99,7 +131,13 @@ def design_solar_system(request: SolarDesignRequest) -> SolarDesignResponse:
             },
             "image_png_base64": image_b64,
         },
-    )
+    }
+    if solar_potential is not None:
+        response_payload["solar_potential"] = solar_potential
+    if data_layers_payload is not None:
+        response_payload["data_layers"] = data_layers_payload.get("layers", {})
+
+    return SolarDesignResponse(**response_payload)
 
 
 @app.get("/healthz")
