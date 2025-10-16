@@ -4,10 +4,15 @@ import json
 import math
 import os
 import re
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
-from shapely.geometry import Polygon
+import numpy as np
+from PIL import Image
+from rasterio.features import shapes
+from rasterio.io import MemoryFile
+from shapely.geometry import Polygon, shape
 
 from .imaging import render_layout
 from .panel_layout import (
@@ -22,6 +27,12 @@ from .schemas import SolarDesignRequest
 
 
 EARTH_RADIUS_M = 6_378_137.0
+
+
+@dataclass
+class DataLayerRenderContext:
+    background: Optional[Image.Image]
+    bounds_m: Optional[Tuple[float, float, float, float]]
 
 
 class SolarApiError(Exception):
@@ -68,6 +79,35 @@ class SolarDesignEngine:
             raise SolarApiError(502, "Solar APIからの応答の解析に失敗しました。") from exc
         return payload
 
+    def fetch_data_layers(self, lat: float, lng: float) -> Dict[str, object]:
+        endpoint = "https://solar.googleapis.com/v1/dataLayers:compute"
+        payload = {
+            "location": {"latitude": lat, "longitude": lng},
+            "radiusMeters": 50,
+            "view": ["DSM", "RGB", "ANNUAL_FLUX"],
+        }
+        try:
+            response = requests.post(
+                endpoint,
+                headers={"Accept": "application/json"},
+                params={"key": self.api_key},
+                json=payload,
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            raise SolarApiError(502, "Solar APIとの通信に失敗しました。再度お試しください。") from exc
+        if response.status_code >= 500:
+            raise SolarApiError(502, "Solar APIの応答に失敗しました。しばらくしてから再度お試しください。")
+        if response.status_code >= 400:
+            raise SolarApiError(404, "指定した地点のデータレイヤーを取得できませんでした。別の場所をお試しください。")
+        try:
+            payload = response.json()
+        except json.JSONDecodeError as exc:
+            raise SolarApiError(502, "Solar APIからの応答の解析に失敗しました。") from exc
+        if not payload.get("layers"):
+            raise SolarApiError(404, "周辺に利用可能なデータレイヤーが見つかりませんでした。")
+        return payload
+
     def build_specs(self) -> List[PanelSpec]:
         specs: List[PanelSpec] = []
         for idx, panel in enumerate(self.request.panels):
@@ -109,6 +149,111 @@ class SolarDesignEngine:
         if not segments:
             raise SolarApiError(404, "屋根ポリゴン情報が取得できませんでした。別の建物でお試しください。")
         return segments
+
+    def build_segments_from_data_layers(
+        self, lat: float, lng: float, data_layers: Dict[str, object]
+    ) -> Tuple[List[SegmentInput], DataLayerRenderContext]:
+        layers = data_layers.get("layers", {})
+        annual_flux_url = layers.get("annualFluxUrl")
+        if not annual_flux_url:
+            raise SolarApiError(404, "日射量レイヤーを取得できませんでした。別の建物でお試しください。")
+
+        flux_bytes = self._download_layer_bytes(annual_flux_url)
+        reference = (float(lng), float(lat))
+        segments: List[SegmentInput] = []
+        with MemoryFile(flux_bytes) as memfile:
+            with memfile.open() as dataset:
+                flux_data = dataset.read(1, masked=True)
+                valid_mask = ~flux_data.mask
+                if not np.any(valid_mask):
+                    raise SolarApiError(404, "日射量データから屋根領域を抽出できませんでした。")
+                flux_values = flux_data[valid_mask]
+                if flux_values.size == 0:
+                    raise SolarApiError(404, "日射量データから屋根領域を抽出できませんでした。")
+                threshold = float(np.percentile(flux_values, 60))
+                roof_mask = (flux_data.filled(0) >= threshold) & valid_mask
+                if not np.any(roof_mask):
+                    roof_mask = valid_mask
+                mask_uint8 = roof_mask.astype("uint8")
+                polygons_lonlat: List[Polygon] = []
+                for geom, value in shapes(mask_uint8, mask=roof_mask, transform=dataset.transform):
+                    if value != 1:
+                        continue
+                    geom_shape = shape(geom)
+                    if geom_shape.is_empty:
+                        continue
+                    if geom_shape.geom_type == "Polygon":
+                        geom_iter = [geom_shape]
+                    else:
+                        geom_iter = [g for g in geom_shape.geoms if not g.is_empty]
+                    polygons_lonlat.extend(geom_iter)
+
+        segment_id = 0
+        for polygon_lonlat in polygons_lonlat:
+            polygon_lonlat = polygon_lonlat.buffer(0)
+            polygon_m = _polygon_lonlat_to_meters(polygon_lonlat, reference)
+            if polygon_m is None:
+                continue
+            if polygon_m.area < 5.0:
+                continue
+            segments.append(
+                SegmentInput(
+                    segment_id=segment_id,
+                    polygon=polygon_m,
+                    azimuth_deg=None,
+                    pitch_deg=None,
+                )
+            )
+            segment_id += 1
+
+        if not segments:
+            raise SolarApiError(404, "屋根ポリゴン情報が取得できませんでした。別の建物でお試しください。")
+
+        background_image: Optional[Image.Image] = None
+        background_bounds: Optional[Tuple[float, float, float, float]] = None
+        rgb_url = layers.get("rgbUrl")
+        if rgb_url:
+            try:
+                rgb_bytes = self._download_layer_bytes(rgb_url)
+                with MemoryFile(rgb_bytes) as memfile:
+                    with memfile.open() as dataset:
+                        band_count = min(3, dataset.count)
+                        if band_count == 0:
+                            raise ValueError("empty rgb dataset")
+                        bands = dataset.read(list(range(1, band_count + 1)))
+                        bands = np.clip(bands, 0, 255)
+                        if band_count == 1:
+                            bands = np.repeat(bands, 3, axis=0)
+                        if band_count == 2:
+                            bands = np.concatenate([bands, bands[:1]], axis=0)
+                        array = np.moveaxis(bands.astype("uint8"), 0, -1)
+                        background_image = Image.fromarray(array, mode="RGB")
+                        bounds = dataset.bounds
+                        minx_m, miny_m = _project_lonlat_to_meters(bounds.left, bounds.bottom, reference)
+                        maxx_m, maxy_m = _project_lonlat_to_meters(bounds.right, bounds.top, reference)
+                        background_bounds = (
+                            min(minx_m, maxx_m),
+                            min(miny_m, maxy_m),
+                            max(minx_m, maxx_m),
+                            max(miny_m, maxy_m),
+                        )
+            except (SolarApiError, ValueError):
+                background_image = None
+                background_bounds = None
+
+        context = DataLayerRenderContext(background=background_image, bounds_m=background_bounds)
+        return segments, context
+
+    def _download_layer_bytes(self, url: str) -> bytes:
+        try:
+            response = requests.get(url, timeout=60)
+        except requests.RequestException as exc:
+            raise SolarApiError(502, "データレイヤーの取得中に通信エラーが発生しました。") from exc
+        if response.status_code >= 500:
+            raise SolarApiError(502, "データレイヤーのダウンロードに失敗しました。しばらくしてから再試しください。")
+        if response.status_code >= 400:
+            raise SolarApiError(404, "データレイヤーの画像を取得できませんでした。")
+        return response.content
 
     def compute_layout(
         self,
@@ -243,6 +388,47 @@ def _convert_vertices_to_meters(
         y = (lat_rad - ref_lat_rad) * EARTH_RADIUS_M
         coords_m.append((x, y))
     return coords_m
+
+
+def _project_lonlat_to_meters(
+    lon_deg: float, lat_deg: float, reference_lon_lat: Tuple[float, float]
+) -> Tuple[float, float]:
+    ref_lon_deg, ref_lat_deg = reference_lon_lat
+    ref_lat_rad = math.radians(ref_lat_deg)
+    ref_lon_rad = math.radians(ref_lon_deg)
+    lon_rad = math.radians(lon_deg)
+    lat_rad = math.radians(lat_deg)
+    x = (lon_rad - ref_lon_rad) * math.cos(ref_lat_rad) * EARTH_RADIUS_M
+    y = (lat_rad - ref_lat_rad) * EARTH_RADIUS_M
+    return x, y
+
+
+def _polygon_lonlat_to_meters(
+    polygon: Polygon, reference_lon_lat: Tuple[float, float]
+) -> Optional[Polygon]:
+    if polygon.is_empty:
+        return None
+    exterior_coords = [
+        _project_lonlat_to_meters(lon, lat, reference_lon_lat) for lon, lat in polygon.exterior.coords
+    ]
+    if len(exterior_coords) < 4:
+        return None
+    interiors_m: List[List[Tuple[float, float]]] = []
+    for interior in polygon.interiors:
+        coords = [_project_lonlat_to_meters(lon, lat, reference_lon_lat) for lon, lat in interior.coords]
+        if len(coords) >= 4:
+            interiors_m.append(coords)
+    polygon_m = Polygon(exterior_coords, interiors_m)
+    if not polygon_m.is_valid:
+        polygon_m = polygon_m.buffer(0)
+    if polygon_m.geom_type == "MultiPolygon":
+        largest = max((geom for geom in polygon_m.geoms if not geom.is_empty), key=lambda g: g.area, default=None)
+        if largest is None:
+            return None
+        polygon_m = largest
+    if polygon_m.is_empty:
+        return None
+    return polygon_m
 
 
 def _get_api_key() -> str:

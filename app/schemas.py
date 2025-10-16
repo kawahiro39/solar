@@ -24,6 +24,10 @@ class SolarDesignRequest(BaseModel):
     max_total: Optional[int] = Field(None, gt=0)
     min_walkway_m: float = Field(0.4, ge=0)
     panels: List[PanelSpecInput]
+    force_data_layers: bool = Field(
+        False,
+        description="When true, always use Solar API dataLayers instead of buildingInsights",
+    )
 
     @validator("panels")
     def validate_panels(cls, value: List[PanelSpecInput]) -> List[PanelSpecInput]:
@@ -66,7 +70,8 @@ class PanelPlacementSummary(BaseModel):
 
 class SolarDesignResponse(BaseModel):
     site: Dict[str, float]
-    solar_potential: Dict[str, object]
+    solar_potential: Optional[Dict[str, object]] = None
+    data_layers: Optional[Dict[str, object]] = None
     result: PanelPlacementSummary
 
 
