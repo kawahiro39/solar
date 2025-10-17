@@ -81,50 +81,35 @@ class SolarDesignEngine:
         return payload
 
     def fetch_data_layers(self, lat: float, lng: float) -> Dict[str, object]:
-        endpoint = "https://solar.googleapis.com/v1/dataLayers:compute"
-        last_not_found: Optional[SolarApiError] = None
-        for quality in ("HIGH", "MEDIUM", "LOW"):
-            exact_required = quality != "LOW"
-            payload = {
-                "location": {"latitude": lat, "longitude": lng},
-                "radiusMeters": 50,
-                "view": ["DSM", "RGB", "ANNUAL_FLUX"],
-                "requiredQuality": quality,
-                "exactQualityRequired": exact_required,
-                # BASE品質（EXPANDED_COVERAGE）を利用する際は experiments に
-                # "EXPANDED_COVERAGE" を追加する必要があります。
-                # Google の承認が必要な実験機能のため、ここでは無効化しています。
-            }
-            try:
-                response = requests.post(
-                    endpoint,
-                    headers={"Accept": "application/json"},
-                    params={"key": self.api_key},
-                    json=payload,
-                    timeout=60,
-                )
-            except requests.RequestException as exc:
-                raise SolarApiError(502, "Solar APIとの通信に失敗しました。再度お試しください。") from exc
-            if response.status_code == 404:
-                last_not_found = SolarApiError(404, COVERAGE_UNAVAILABLE_MESSAGE)
-                continue
-            if response.status_code >= 500:
-                raise SolarApiError(502, "Solar APIの応答に失敗しました。しばらくしてから再度お試しください。")
-            if response.status_code >= 400:
-                raise SolarApiError(400, "指定した位置を解釈できませんでした。座標を再確認してください。")
-            try:
-                payload = response.json()
-            except json.JSONDecodeError as exc:
-                raise SolarApiError(502, "Solar APIからの応答の解析に失敗しました。") from exc
-            layers = payload.get("layers")
-            if not layers:
-                last_not_found = SolarApiError(404, COVERAGE_UNAVAILABLE_MESSAGE)
-                continue
-            return payload
-
-        if last_not_found is not None:
-            raise last_not_found
-        raise SolarApiError(404, COVERAGE_UNAVAILABLE_MESSAGE)
+        endpoint = "https://solar.googleapis.com/v1/dataLayers:get"
+        params = {
+            "location.latitude": lat,
+            "location.longitude": lng,
+            "radiusMeters": 50,
+            "view": "IMAGERY_AND_ANNUAL_FLUX_LAYERS",
+            "requiredQuality": "BASE",
+            "exactQualityRequired": "false",
+            "key": self.api_key,
+        }
+        headers = {"Accept": "application/json"}
+        try:
+            response = requests.get(endpoint, headers=headers, params=params, timeout=60)
+        except requests.RequestException as exc:
+            raise SolarApiError(502, "Solar APIとの通信に失敗しました。再度お試しください。") from exc
+        if response.status_code == 404:
+            raise SolarApiError(404, COVERAGE_UNAVAILABLE_MESSAGE)
+        if response.status_code >= 500:
+            raise SolarApiError(502, "Solar APIの応答に失敗しました。しばらくしてから再度お試しください。")
+        if response.status_code >= 400:
+            raise SolarApiError(400, "指定した位置を解釈できませんでした。座標を再確認してください。")
+        try:
+            payload = response.json()
+        except json.JSONDecodeError as exc:
+            raise SolarApiError(502, "Solar APIからの応答の解析に失敗しました。") from exc
+        layers = payload.get("layers")
+        if not layers:
+            raise SolarApiError(404, COVERAGE_UNAVAILABLE_MESSAGE)
+        return payload
 
     def build_specs(self) -> List[PanelSpec]:
         specs: List[PanelSpec] = []
