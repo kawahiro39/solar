@@ -52,6 +52,33 @@ class SquareImageResponse(BaseModel):
     meters_per_pixel: float
 
 
+class SquareImageCenter(BaseModel):
+    lat: float
+    lng: float
+    zoom: float
+
+
+class SquareImageRequest(BaseModel):
+    gmaps_url: str = Field(..., min_length=1)
+    square_size_px: int = Field(640, ge=64, le=1024)
+    scale: int = Field(2, ge=1, le=4)
+    maptype: str = Field("satellite")
+
+    @validator("maptype")
+    def validate_maptype(cls, value: str) -> str:
+        allowed = {"satellite"}
+        if value not in allowed:
+            raise ValueError("maptype must be one of: satellite")
+        return value
+
+
+class SquareImageResponse(BaseModel):
+    image_data_uri: str
+    center: SquareImageCenter
+    square_size_px: int
+    meters_per_pixel: float
+
+
 class SolarDesignRequest(BaseModel):
     map_url: Optional[str] = None
     lat: Optional[float] = Field(None, description="Latitude in decimal degrees")
