@@ -21,7 +21,10 @@ from .panel_layout import (
     PanelSpec,
     SegmentInput,
     aggregate_mix,
+    determine_rotation_candidates,
     fill_segments,
+    infer_segment_orientation,
+    simplify_polygon_for_layout,
 )
 from .schemas import SolarDesignRequest
 
@@ -148,7 +151,17 @@ class SolarDesignEngine:
             segment_id = segment.get("segmentId", index)
             azimuth = segment.get("azimuthDegrees")
             pitch = segment.get("pitchDegrees")
-            segments.append(SegmentInput(segment_id=segment_id, polygon=polygon, azimuth_deg=azimuth, pitch_deg=pitch))
+            polygon = simplify_polygon_for_layout(polygon)
+            inferred = infer_segment_orientation(polygon)
+            segments.append(
+                SegmentInput(
+                    segment_id=segment_id,
+                    polygon=polygon,
+                    azimuth_deg=azimuth,
+                    pitch_deg=pitch,
+                    inferred_azimuth_deg=inferred,
+                )
+            )
         if not segments:
             raise SolarApiError(404, "屋根ポリゴン情報が取得できませんでした。別の建物でお試しください。")
         return segments
@@ -199,12 +212,15 @@ class SolarDesignEngine:
                 continue
             if polygon_m.area < 5.0:
                 continue
+            simplified = simplify_polygon_for_layout(polygon_m)
+            inferred = infer_segment_orientation(simplified)
             segments.append(
                 SegmentInput(
                     segment_id=segment_id,
-                    polygon=polygon_m,
+                    polygon=simplified,
                     azimuth_deg=None,
                     pitch_deg=None,
+                    inferred_azimuth_deg=inferred,
                 )
             )
             segment_id += 1
@@ -274,7 +290,9 @@ class SolarDesignEngine:
             else ["portrait", "landscape"]
         )
 
-        best_orientation = "portrait"
+        rotation_candidates = determine_rotation_candidates(segments)
+
+        best_orientation = orientations[0]
         best_mix: Dict[int, int] = {}
         best_placements: List[PanelPlacement] = []
         best_face_mix: Dict[int, Dict[int, int]] = {}
@@ -282,29 +300,32 @@ class SolarDesignEngine:
 
         best_limits: Dict[int, Optional[int]] = max_per_face
 
-        for orientation in orientations:
-            layout = fill_segments(
-                segments=segments,
-                specs=specs,
-                density=density_profile,
-                min_walkway=min_walkway,
-                max_total=max_total,
-                max_per_face=max_per_face,
-                orientation=orientation,
-            )
-            mix = aggregate_mix(specs, layout.placements)
-            dc_kw = sum(specs[idx].watt * count for idx, count in mix.items()) / 1000.0
-            efficiency_vector = [mix.get(spec.index, 0) for spec in specs]
-            score = (dc_kw, efficiency_vector)
-            if dc_kw > best_score[0] + 1e-6 or (
-                math.isclose(dc_kw, best_score[0], rel_tol=1e-6) and efficiency_vector > best_score[1]
-            ):
-                best_score = score
-                best_orientation = orientation
-                best_mix = mix
-                best_placements = list(layout.placements)
-                best_face_mix = self._segment_mix(layout.segments, specs)
-                best_limits = max_per_face
+        for rotation in rotation_candidates:
+            for orientation in orientations:
+                layout = fill_segments(
+                    segments=segments,
+                    specs=specs,
+                    density=density_profile,
+                    min_walkway=min_walkway,
+                    max_total=max_total,
+                    max_per_face=max_per_face,
+                    orientation=orientation,
+                    rotation_override=rotation,
+                )
+                mix = aggregate_mix(specs, layout.placements)
+                dc_kw = sum(specs[idx].watt * count for idx, count in mix.items()) / 1000.0
+                efficiency_vector = [mix.get(spec.index, 0) for spec in specs]
+                score = (dc_kw, efficiency_vector)
+                if dc_kw > best_score[0] + 1e-6 or (
+                    math.isclose(dc_kw, best_score[0], rel_tol=1e-6)
+                    and efficiency_vector > best_score[1]
+                ):
+                    best_score = score
+                    best_orientation = orientation
+                    best_mix = mix
+                    best_placements = list(layout.placements)
+                    best_face_mix = self._segment_mix(layout.segments, specs)
+                    best_limits = max_per_face
 
         return best_orientation, best_placements, best_mix, best_face_mix, best_limits
 

@@ -12,7 +12,7 @@ A FastAPI service intended for deployment on Cloud Run that orchestrates Google 
 ## Request payload expectations
 
 - `/square_image` always responds with `image_data_uri`, `square_size_px`, and a `meters_per_pixel` (m/px) figure.
-- `/layout_panels` expects each `roofs[].polygon` entry to be supplied in metres (local X/Y space) while `panels[].w_mm`, `h_mm`, and `gap_mm` are in millimetres. `orientation_mode` accepts `auto`, `portrait`, or `landscape`, and `min_walkway_m` defaults to `0.4` when omitted. `max_total` and `max_per_face` are optional.
+- `/layout_panels` expects each `roofs[].polygon` entry to be supplied in metres (local X/Y space) while `panels[].w_mm`, `h_mm`, and `gap_mm` are in millimetres. `orientation_mode` accepts `auto`, `portrait`, or `landscape`, and `min_walkway_m` defaults to `0.4` when omitted. `max_total` and `max_per_face` are optional. The response includes `summary.rotation_deg_used` when the optimizer rotates segments away from the inferred roof axis (candidates are limited to north–south, east–west, or the polygon’s minimum bounding rectangle).
 
 ## Environment
 

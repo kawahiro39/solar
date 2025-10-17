@@ -136,6 +136,10 @@ class LayoutPanelsSummary(BaseModel):
     total_panels: int
     total_kw: float
     by_option: List[LayoutPanelsSummaryOption] = Field(default_factory=list)
+    rotation_deg_used: Optional[float] = Field(
+        None,
+        description="Rotation angle (degrees) applied when optimizing placement, if any.",
+    )
 
 
 class LayoutPanelsResponse(BaseModel):

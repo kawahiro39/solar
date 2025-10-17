@@ -33,7 +33,10 @@ from .panel_layout import (
     PanelSpec,
     SegmentInput,
     aggregate_mix,
+    determine_rotation_candidates,
     fill_segments,
+    infer_segment_orientation,
+    simplify_polygon_for_layout,
 )
 from .schemas import (
     ErrorResponse,
@@ -261,7 +264,13 @@ def _scale_polygon(points: List[Tuple[float, float]], scale_x: float, scale_y: f
 
 def _prepare_segments(
     faces: List[RoofFaceInput],
-) -> Tuple[List[SegmentInput], List[Polygon], float, Tuple[float, float]]:
+) -> Tuple[
+    List[SegmentInput],
+    List[Polygon],
+    float,
+    Tuple[float, float],
+    List[Optional[float]],
+]:
     if not faces:
         raise ValueError("No faces provided")
 
@@ -280,19 +289,22 @@ def _prepare_segments(
         polygon = Polygon(local_points)
         if polygon.is_empty or polygon.area <= 0:
             continue
-        azimuth = face.azimuth_deg if face.azimuth_deg is not None else 0.0
+        polygon = simplify_polygon_for_layout(polygon)
+        inferred_orientation = infer_segment_orientation(polygon)
         segments.append(
             SegmentInput(
                 segment_id=idx,
                 polygon=polygon,
-                azimuth_deg=azimuth,
+                azimuth_deg=face.azimuth_deg,
                 pitch_deg=None,
+                inferred_azimuth_deg=inferred_orientation,
             )
         )
         roof_polygons.append(polygon)
 
     total_area = sum(poly.area for poly in roof_polygons)
-    return segments, roof_polygons, total_area, (ref_lat, ref_lng)
+    rotation_candidates = determine_rotation_candidates(segments)
+    return segments, roof_polygons, total_area, (ref_lat, ref_lng), rotation_candidates
 
 
 def _optimize_layout(
@@ -315,7 +327,7 @@ def _optimize_layout(
     if not specs:
         raise ValueError("No panel specifications provided")
 
-    segments, roof_polygons, roof_area, _ = _prepare_segments(faces)
+    segments, roof_polygons, roof_area, _, rotation_candidates = _prepare_segments(faces)
     if not segments:
         raise ValueError("有効な屋根ポリゴンが見つかりませんでした。")
 
@@ -336,28 +348,43 @@ def _optimize_layout(
     best_layout = None
     best_mix: Dict[int, int] = {}
     best_dc_kw = -1.0
+    best_rotation: Optional[float] = None
 
-    for orientation in orientation_options:
-        layout = fill_segments(
-            segments=segments,
-            specs=specs,
-            density=density,
-            min_walkway=min_walkway,
-            max_total=max_total,
-            max_per_face=build_limits(),
-            orientation=orientation,
-        )
-        mix = aggregate_mix(specs, layout.placements)
-        dc_kw = sum(specs[idx].watt * count for idx, count in mix.items()) / 1000.0
-        if dc_kw > best_dc_kw:
-            best_dc_kw = dc_kw
-            best_orientation = orientation
-            best_layout = layout
-            best_mix = mix
+    for rotation in rotation_candidates:
+        for orientation in orientation_options:
+            layout = fill_segments(
+                segments=segments,
+                specs=specs,
+                density=density,
+                min_walkway=min_walkway,
+                max_total=max_total,
+                max_per_face=build_limits(),
+                orientation=orientation,
+                rotation_override=rotation,
+            )
+            mix = aggregate_mix(specs, layout.placements)
+            dc_kw = sum(specs[idx].watt * count for idx, count in mix.items()) / 1000.0
+            if dc_kw > best_dc_kw:
+                best_dc_kw = dc_kw
+                best_orientation = orientation
+                best_layout = layout
+                best_mix = mix
+                best_rotation = rotation
 
     assert best_layout is not None
     placements = list(best_layout.placements)
-    return specs, placements, best_mix, best_orientation, roof_polygons, roof_area, best_dc_kw
+    rotation_value = None if best_rotation is None else round(float(best_rotation), 2)
+
+    return (
+        specs,
+        placements,
+        best_mix,
+        best_orientation,
+        roof_polygons,
+        roof_area,
+        best_dc_kw,
+        rotation_value,
+    )
 
 
 def _resolve_max_limit(max_per_face: Optional[Union[int, Dict[str, int]]]) -> Optional[int]:
@@ -417,7 +444,16 @@ async def generate_square_image(request: SquareImageRequest) -> SquareImageRespo
 )
 def layout_panels(request: LayoutPanelsRequest) -> LayoutPanelsResponse:
     try:
-        specs, placements, mix, _orientation, roof_polygons, _roof_area, dc_kw = _optimize_layout(
+        (
+            specs,
+            placements,
+            mix,
+            _orientation,
+            roof_polygons,
+            _roof_area,
+            dc_kw,
+            rotation_used,
+        ) = _optimize_layout(
             request.roofs,
             request.panels,
             request.orientation_mode,
@@ -454,6 +490,7 @@ def layout_panels(request: LayoutPanelsRequest) -> LayoutPanelsResponse:
         total_panels=total_panels,
         total_kw=total_kw,
         by_option=summary_options,
+        rotation_deg_used=rotation_used,
     )
 
     return LayoutPanelsResponse(layout_image_data_uri=image_data_uri, summary=summary)
@@ -580,7 +617,16 @@ def optimize_layout(request: LayoutOptimizeRequest) -> LayoutOptimizeResponse:
         raise HTTPException(status_code=400, detail="パネル仕様が指定されていません。")
 
     try:
-        specs, placements, mix, orientation, roof_polygons, roof_area, dc_kw = _optimize_layout(
+        (
+            specs,
+            placements,
+            mix,
+            orientation,
+            roof_polygons,
+            roof_area,
+            dc_kw,
+            rotation_used,
+        ) = _optimize_layout(
             request.faces,
             request.panels,
             request.orientation_mode,
@@ -673,7 +719,16 @@ def integrated_design(request: SolarDesignRequest) -> DesignPipelineResponse:
     max_limit = _resolve_max_limit(request.max_per_face)
 
     try:
-        specs, placements, mix, orientation, roof_polygons, roof_area, dc_kw = _optimize_layout(
+        (
+            specs,
+            placements,
+            mix,
+            orientation,
+            roof_polygons,
+            roof_area,
+            dc_kw,
+            rotation_used,
+        ) = _optimize_layout(
             face_inputs,
             request.panels,
             request.orientation_mode,
