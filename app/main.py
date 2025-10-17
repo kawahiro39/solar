@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+import base64
+import logging
+from typing import Dict, List, Optional, Union
+
+import cv2
+import numpy as np
+import requests
 
 from fastapi import FastAPI, HTTPException
 from shapely.geometry import Polygon
@@ -10,6 +16,7 @@ from .schemas import (
     ErrorResponse,
     PanelMixEntry,
     PanelSpecInput,
+    RoofDetectionResponse,
     SegmentPlacementEntry,
     SolarDesignRequest,
     SolarDesignResponse,
@@ -19,17 +26,29 @@ from .solar_service import (
     DataLayerRenderContext,
     SolarApiError,
     SolarDesignEngine,
+    _get_api_key,
 )
 
 app = FastAPI(title="Solar Design Service", version="1.0.0")
 
+logger = logging.getLogger(__name__)
 
-@app.post("/solar/design", response_model=SolarDesignResponse, responses={
-    400: {"model": ErrorResponse},
-    404: {"model": ErrorResponse},
-    502: {"model": ErrorResponse},
-})
-def design_solar_system(request: SolarDesignRequest) -> SolarDesignResponse:
+PIXEL_AREA_M2 = 0.014
+MIN_CONTOUR_AREA = 500
+
+
+@app.post(
+    "/solar/design",
+    response_model=Union[SolarDesignResponse, RoofDetectionResponse],
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        502: {"model": ErrorResponse},
+    },
+)
+def design_solar_system(
+    request: SolarDesignRequest,
+) -> Union[SolarDesignResponse, RoofDetectionResponse]:
     try:
         engine = SolarDesignEngine(request)
         lat, lng = engine.resolve_coordinates()
@@ -66,20 +85,44 @@ def design_solar_system(request: SolarDesignRequest) -> SolarDesignResponse:
         except SolarApiError as exc:
             if exc.status_code == 404:
                 data_layers_error = exc
+                logger.info(
+                    "Solar API returned 404 for data layers at lat=%s, lng=%s. Attempting fallbacks.",
+                    lat,
+                    lng,
+                )
                 if building_insights_error and building_insights_error.status_code == 404:
-                    raise HTTPException(status_code=404, detail=COVERAGE_UNAVAILABLE_MESSAGE)
+                    try:
+                        return fetch_roof_from_static_map(lat, lng)
+                    except HTTPException:
+                        raise
+                    except Exception as fallback_error:
+                        logger.exception("Roof detection fallback failed: %s", fallback_error)
+                        raise HTTPException(status_code=404, detail=COVERAGE_UNAVAILABLE_MESSAGE)
                 try:
                     solar_data = engine.fetch_building_insights(lat, lng)
                     segments = engine.build_segments(solar_data)
                 except SolarApiError as fallback_exc:
                     if fallback_exc.status_code == 404:
-                        raise HTTPException(status_code=404, detail=COVERAGE_UNAVAILABLE_MESSAGE)
+                        try:
+                            return fetch_roof_from_static_map(lat, lng)
+                        except HTTPException:
+                            raise
+                        except Exception as roof_exc:
+                            logger.exception("Roof detection fallback failed: %s", roof_exc)
+                            raise HTTPException(status_code=404, detail=COVERAGE_UNAVAILABLE_MESSAGE)
                     raise HTTPException(status_code=fallback_exc.status_code, detail=fallback_exc.message)
             else:
                 raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
     if not segments:
-        detail_message = COVERAGE_UNAVAILABLE_MESSAGE if data_layers_error else "屋根ポリゴン情報が取得できませんでした。別の建物でお試しください。"
+        if data_layers_error and data_layers_error.status_code == 404:
+            logger.info("Falling back to roof detection for lat=%s, lng=%s", lat, lng)
+            return fetch_roof_from_static_map(lat, lng)
+        detail_message = (
+            COVERAGE_UNAVAILABLE_MESSAGE
+            if data_layers_error
+            else "屋根ポリゴン情報が取得できませんでした。別の建物でお試しください。"
+        )
         raise HTTPException(status_code=404, detail=detail_message)
 
     try:
@@ -164,3 +207,75 @@ def design_solar_system(request: SolarDesignRequest) -> SolarDesignResponse:
 @app.get("/healthz")
 def health_check() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+def fetch_roof_from_static_map(lat: float, lng: float) -> RoofDetectionResponse:
+    try:
+        api_key = _get_api_key()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    params = {
+        "center": f"{lat},{lng}",
+        "zoom": 20,
+        "size": "640x640",
+        "maptype": "satellite",
+        "key": api_key,
+    }
+    try:
+        response = requests.get(
+            "https://maps.googleapis.com/maps/api/staticmap", params=params, timeout=30
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail="衛星画像の取得に失敗しました。再度お試しください。") from exc
+
+    if response.status_code >= 500:
+        raise HTTPException(status_code=502, detail="衛星画像の取得に失敗しました。しばらくしてから再度お試しください。")
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="衛星画像の取得に失敗しました。リクエストを確認してください。")
+
+    image_array = np.frombuffer(response.content, dtype=np.uint8)
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if image is None:
+        return RoofDetectionResponse(
+            roof_detected=False,
+            message="衛星画像から屋根を特定できませんでした。",
+        )
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    significant_contours = [cnt for cnt in contours if cv2.contourArea(cnt) >= MIN_CONTOUR_AREA]
+
+    if not significant_contours:
+        return RoofDetectionResponse(
+            roof_detected=False,
+            message="屋根を特定できませんでした。",
+        )
+
+    roof_contour = max(significant_contours, key=cv2.contourArea)
+    perimeter = cv2.arcLength(roof_contour, True)
+    simplified = cv2.approxPolyDP(roof_contour, 0.02 * perimeter, True)
+    if len(simplified) < 3:
+        simplified = roof_contour
+
+    overlay = image.copy()
+    cv2.drawContours(overlay, [simplified], -1, (0, 0, 255), 2)
+    success, buffer = cv2.imencode(".png", overlay)
+    image_overlay_base64 = None
+    if success:
+        encoded_overlay = base64.b64encode(buffer.tobytes()).decode("ascii")
+        image_overlay_base64 = "data:image/png;base64," + encoded_overlay
+
+    contour_area_px = float(cv2.contourArea(roof_contour))
+    roof_area_m2 = round(contour_area_px * PIXEL_AREA_M2, 2)
+    roof_polygon = [[int(point[0][0]), int(point[0][1])] for point in simplified]
+
+    return RoofDetectionResponse(
+        roof_detected=True,
+        roof_area_m2=roof_area_m2,
+        roof_polygon=roof_polygon,
+        image_overlay_base64=image_overlay_base64,
+    )
