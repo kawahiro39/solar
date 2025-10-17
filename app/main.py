@@ -14,7 +14,12 @@ from .schemas import (
     SolarDesignRequest,
     SolarDesignResponse,
 )
-from .solar_service import DataLayerRenderContext, SolarApiError, SolarDesignEngine
+from .solar_service import (
+    COVERAGE_UNAVAILABLE_MESSAGE,
+    DataLayerRenderContext,
+    SolarApiError,
+    SolarDesignEngine,
+)
 
 app = FastAPI(title="Solar Design Service", version="1.0.0")
 
@@ -40,6 +45,7 @@ def design_solar_system(request: SolarDesignRequest) -> SolarDesignResponse:
     render_context: Optional[DataLayerRenderContext] = None
 
     segments = []
+    building_insights_error: Optional[SolarApiError] = None
     if not use_data_layers:
         try:
             solar_data = engine.fetch_building_insights(lat, lng)
@@ -48,18 +54,33 @@ def design_solar_system(request: SolarDesignRequest) -> SolarDesignResponse:
             if exc.status_code == 404:
                 use_data_layers = True
                 solar_data = {}
+                building_insights_error = exc
             else:
                 raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
+    data_layers_error: Optional[SolarApiError] = None
     if use_data_layers:
         try:
             data_layers_payload = engine.fetch_data_layers(lat, lng)
             segments, render_context = engine.build_segments_from_data_layers(lat, lng, data_layers_payload)
         except SolarApiError as exc:
-            raise HTTPException(status_code=exc.status_code, detail=exc.message)
+            if exc.status_code == 404:
+                data_layers_error = exc
+                if building_insights_error and building_insights_error.status_code == 404:
+                    raise HTTPException(status_code=404, detail=COVERAGE_UNAVAILABLE_MESSAGE)
+                try:
+                    solar_data = engine.fetch_building_insights(lat, lng)
+                    segments = engine.build_segments(solar_data)
+                except SolarApiError as fallback_exc:
+                    if fallback_exc.status_code == 404:
+                        raise HTTPException(status_code=404, detail=COVERAGE_UNAVAILABLE_MESSAGE)
+                    raise HTTPException(status_code=fallback_exc.status_code, detail=fallback_exc.message)
+            else:
+                raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
     if not segments:
-        raise HTTPException(status_code=404, detail="屋根ポリゴン情報が取得できませんでした。別の建物でお試しください。")
+        detail_message = COVERAGE_UNAVAILABLE_MESSAGE if data_layers_error else "屋根ポリゴン情報が取得できませんでした。別の建物でお試しください。"
+        raise HTTPException(status_code=404, detail=detail_message)
 
     try:
         orientation, placements, mix, face_mix, face_limits = engine.compute_layout(segments, specs)
