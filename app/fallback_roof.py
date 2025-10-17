@@ -323,8 +323,8 @@ def place_panels(
 
 
 def encode_image(image: Image.Image) -> str:
-    buffer = base64.b64encode(_image_to_png_bytes(image))
-    return buffer.decode("ascii")
+    buffer = base64.b64encode(_image_to_png_bytes(image)).decode("ascii")
+    return f"data:image/png;base64,{buffer}"
 
 
 def _image_to_png_bytes(image: Image.Image) -> bytes:
