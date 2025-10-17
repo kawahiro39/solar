@@ -14,19 +14,38 @@ from shapely.geometry import Polygon, box
 
 from .panel_layout import PanelSpec
 from .schemas import FallbackPanelResult, PanelMixEntry, PanelSpecInput
+from .geo import (
+    meters_per_pixel as compute_mpp,
+    polygon_pixels_to_latlng,
+)
 
 
 STATIC_MAP_ENDPOINT = "https://maps.googleapis.com/maps/api/staticmap"
 STATIC_MAP_SIZE = (640, 640)
 STATIC_MAP_ZOOM = 21
 STATIC_MAP_SCALE = 2
-EARTH_RADIUS_M = 6_378_137.0
 
 
 @dataclass
 class FallbackPanelPlacement:
     spec: PanelSpec
     rectangle: Polygon
+
+
+def panel_specs_from_inputs(inputs: Sequence[PanelSpecInput]) -> List[PanelSpec]:
+    specs: List[PanelSpec] = []
+    for idx, panel in enumerate(inputs):
+        specs.append(
+            PanelSpec(
+                index=idx,
+                width_m=panel.w_mm / 1000.0,
+                height_m=panel.h_mm / 1000.0,
+                gap_m=panel.gap_mm / 1000.0,
+                watt=panel.watt,
+                original=panel.dict(),
+            )
+        )
+    return specs
 
 
 def download_static_map(api_key: str, lat: float, lng: float) -> np.ndarray:
@@ -218,15 +237,23 @@ def orthogonalize_contour(contour: np.ndarray) -> np.ndarray:
     return cleaned.reshape(-1, 1, 2)
 
 
-def meters_per_pixel(lat: float) -> float:
-    return (
-        math.cos(math.radians(lat))
-        * 2.0
-        * math.pi
-        * EARTH_RADIUS_M
-        / (256.0 * (2 ** STATIC_MAP_ZOOM))
-        / STATIC_MAP_SCALE
-    )
+@dataclass
+class RoofAnalysis:
+    lat: float
+    lng: float
+    original_image: np.ndarray
+    sharpened_image: np.ndarray
+    roof_mask: np.ndarray
+    rotated_mask: np.ndarray
+    rotated_image: np.ndarray
+    rotation_matrix: np.ndarray
+    inverse_rotation_matrix: np.ndarray
+    component_contour: np.ndarray
+    rotated_polygon: Polygon
+    original_polygon: Polygon
+    orientation: float
+    mpp: float
+    confidence: float
 
 
 def polygon_from_contour(contour: np.ndarray) -> Polygon:
@@ -234,6 +261,51 @@ def polygon_from_contour(contour: np.ndarray) -> Polygon:
     polygon = Polygon(points)
     polygon = polygon.buffer(0)
     return polygon
+
+
+def analyze_roof(api_key: str, lat: float, lng: float) -> Optional[RoofAnalysis]:
+    original_image = download_static_map(api_key, lat, lng)
+    sharpened = unsharp_mask(original_image)
+    roof_mask = build_roof_mask(sharpened)
+    orientation = estimate_orientation(roof_mask)
+
+    rotated_mask, rotation_matrix = rotate_image(roof_mask, -orientation, flags=cv2.INTER_NEAREST)
+    rotated_image, _ = rotate_image(sharpened, -orientation)
+    component = select_main_component(rotated_mask)
+    if component is None:
+        return None
+
+    ortho_contour = orthogonalize_contour(component)
+    rotated_polygon = polygon_from_contour(ortho_contour)
+    if rotated_polygon.is_empty:
+        return None
+
+    inverse_matrix = invert_rotation_matrix(rotation_matrix)
+    original_points = rotate_points(ortho_contour.reshape(-1, 2), inverse_matrix)
+    original_polygon = Polygon(original_points).buffer(0)
+    if original_polygon.is_empty:
+        return None
+
+    mpp = compute_mpp(lat, STATIC_MAP_ZOOM, STATIC_MAP_SCALE)
+    confidence = compute_confidence(component, rotated_polygon)
+
+    return RoofAnalysis(
+        lat=lat,
+        lng=lng,
+        original_image=original_image,
+        sharpened_image=sharpened,
+        roof_mask=roof_mask,
+        rotated_mask=rotated_mask,
+        rotated_image=rotated_image,
+        rotation_matrix=rotation_matrix,
+        inverse_rotation_matrix=inverse_matrix,
+        component_contour=component,
+        rotated_polygon=rotated_polygon,
+        original_polygon=original_polygon,
+        orientation=orientation,
+        mpp=mpp,
+        confidence=confidence,
+    )
 
 
 def place_panels(
@@ -456,38 +528,20 @@ def run_fallback_detection(
     max_face: Optional[int],
     debug: bool = False,
 ) -> Dict[str, object]:
-    original_image = download_static_map(api_key, lat, lng)
-    sharpened = unsharp_mask(original_image)
-    roof_mask = build_roof_mask(sharpened)
-    orientation = estimate_orientation(roof_mask)
-
-    rotated_mask, rotation_matrix = rotate_image(roof_mask, -orientation, flags=cv2.INTER_NEAREST)
-    rotated_image, _ = rotate_image(sharpened, -orientation)
-    component = select_main_component(rotated_mask)
-    if component is None:
+    analysis = analyze_roof(api_key, lat, lng)
+    if analysis is None:
         return {
             "roof_detected": False,
             "message": "屋根を特定できませんでした。",
         }
 
-    ortho_contour = orthogonalize_contour(component)
-    rotated_polygon = polygon_from_contour(ortho_contour)
-    if rotated_polygon.is_empty:
-        return {
-            "roof_detected": False,
-            "message": "屋根を特定できませんでした。",
-        }
+    rotated_polygon = analysis.rotated_polygon
+    original_polygon = analysis.original_polygon
+    component = analysis.component_contour
+    mpp = analysis.mpp
+    orientation = analysis.orientation
+    sharpened = analysis.sharpened_image
 
-    inverse_matrix = invert_rotation_matrix(rotation_matrix)
-    original_points = rotate_points(ortho_contour.reshape(-1, 2), inverse_matrix)
-    original_polygon = Polygon(original_points).buffer(0)
-    if original_polygon.is_empty:
-        return {
-            "roof_detected": False,
-            "message": "屋根を特定できませんでした。",
-        }
-
-    mpp = meters_per_pixel(lat)
     limit = max_total
     if max_face is not None:
         limit = min(max_total, max_face) if max_total is not None else max_face
@@ -495,7 +549,7 @@ def run_fallback_detection(
     orientation_mode = orientation_mode or "auto"
     orientation_used, placements_rotated = place_panels(rotated_polygon, specs, mpp, orientation_mode, limit)
 
-    shapely_matrix = cv_matrix_to_shapely(inverse_matrix)
+    shapely_matrix = cv_matrix_to_shapely(analysis.inverse_rotation_matrix)
     placements: List[FallbackPanelPlacement] = []
     for placement in placements_rotated:
         transformed = affinity.affine_transform(placement.rectangle, shapely_matrix)
@@ -503,7 +557,7 @@ def run_fallback_detection(
 
     contour_area_px = float(cv2.contourArea(component))
     roof_area_m2 = contour_area_px * (mpp ** 2)
-    confidence = compute_confidence(component, rotated_polygon)
+    confidence = analysis.confidence
 
     mix_entries = placements_to_mix_entries(placements)
     total_panels = sum(entry.count for entry in mix_entries)
@@ -515,10 +569,25 @@ def run_fallback_detection(
         for x, y in list(original_polygon.exterior.coords)[:-1]
     ]
 
+    width = analysis.original_image.shape[1]
+    height = analysis.original_image.shape[0]
+    roof_polygon_latlng = [
+        [lng_val, lat_val]
+        for lat_val, lng_val in polygon_pixels_to_latlng(
+            analysis.lat,
+            analysis.lng,
+            STATIC_MAP_ZOOM,
+            STATIC_MAP_SCALE,
+            width,
+            height,
+            [(x, y) for x, y in list(original_polygon.exterior.coords)[:-1]],
+        )
+    ]
+
     debug_images = None
     if debug:
-        edges = cv2.Canny(rotated_mask, 50, 150)
-        debug_images = build_debug_images(rotated_mask, edges, rotated_polygon)
+        edges = cv2.Canny(analysis.rotated_mask, 50, 150)
+        debug_images = build_debug_images(analysis.rotated_mask, edges, rotated_polygon)
 
     normalized_orientation = (orientation + 180.0) % 180.0
 
@@ -539,6 +608,7 @@ def run_fallback_detection(
         "panel_counts": total_panels,
         "dc_kw": round(dc_kw, 3),
         "roof_polygon": roof_polygon_points,
+        "roof_polygon_latlng": roof_polygon_latlng,
         "result": result_model,
         "image_png_base64": image_b64,
     }

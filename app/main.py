@@ -1,21 +1,47 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import requests
 
 from fastapi import FastAPI, HTTPException
+import numpy as np
+from PIL import Image
 from shapely.geometry import Polygon
 
-from .fallback_roof import run_fallback_detection
+from .fallback_roof import (
+    analyze_roof,
+    encode_image,
+    panel_specs_from_inputs,
+    run_fallback_detection,
+    STATIC_MAP_SCALE,
+    STATIC_MAP_ZOOM,
+)
 from .imaging import render_layout
-from .panel_layout import PanelSpec
+from .panel_layout import (
+    DENSITY_PROFILES,
+    PanelPlacement,
+    PanelSpec,
+    SegmentInput,
+    aggregate_mix,
+    fill_segments,
+)
 from .schemas import (
     ErrorResponse,
+    DesignPipelineResponse,
+    LayoutOptimizeRequest,
+    LayoutOptimizeResponse,
+    OrthoImageRequest,
+    OrthoImageResponse,
     PanelMixEntry,
     PanelSpecInput,
+    FallbackPanelResult,
     RoofDetectionResponse,
+    RoofFaceInput,
+    RoofSegmentRequest,
+    RoofSegmentResponse,
+    RoofFaceOutput,
     SegmentPlacementEntry,
     SolarDesignRequest,
     SolarDesignResponse,
@@ -27,10 +53,384 @@ from .solar_service import (
     SolarDesignEngine,
     _get_api_key,
 )
+from .geo import polygon_latlng_to_local, polygon_pixels_to_latlng
 
 app = FastAPI(title="Solar Design Service", version="1.0.0")
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_ATTRIBUTION = ["© OpenStreetMap contributors", "Imagery © Google"]
+
+
+def _pil_from_bgr(image: np.ndarray) -> Image.Image:
+    return Image.fromarray(image[:, :, ::-1])
+
+
+def _scale_polygon(points: List[Tuple[float, float]], scale_x: float, scale_y: float) -> List[List[float]]:
+    return [[float(x * scale_x), float(y * scale_y)] for x, y in points]
+
+
+def _prepare_segments(
+    faces: List[RoofFaceInput],
+) -> Tuple[List[SegmentInput], List[Polygon], float, Tuple[float, float]]:
+    if not faces:
+        raise ValueError("No faces provided")
+
+    first_polygon = faces[0].polygon
+    if not first_polygon:
+        raise ValueError("Face polygon is empty")
+
+    ref_lng, ref_lat = first_polygon[0]
+    segments: List[SegmentInput] = []
+    roof_polygons: List[Polygon] = []
+    for idx, face in enumerate(faces):
+        if len(face.polygon) < 3:
+            continue
+        latlng_points = [(point[1], point[0]) for point in face.polygon]
+        local_points = polygon_latlng_to_local(latlng_points, ref_lat, ref_lng)
+        polygon = Polygon(local_points)
+        if polygon.is_empty or polygon.area <= 0:
+            continue
+        azimuth = face.azimuth_deg if face.azimuth_deg is not None else 0.0
+        segments.append(
+            SegmentInput(
+                segment_id=idx,
+                polygon=polygon,
+                azimuth_deg=azimuth,
+                pitch_deg=None,
+            )
+        )
+        roof_polygons.append(polygon)
+
+    total_area = sum(poly.area for poly in roof_polygons)
+    return segments, roof_polygons, total_area, (ref_lat, ref_lng)
+
+
+def _optimize_layout(
+    faces: List[RoofFaceInput],
+    panel_inputs: List[PanelSpecInput],
+    orientation_mode: str,
+    max_total: Optional[int],
+    max_per_face: Optional[int],
+    min_walkway: float,
+) -> Tuple[
+    List[PanelSpec],
+    List[PanelPlacement],
+    Dict[int, int],
+    str,
+    List[Polygon],
+    float,
+    float,
+]:
+    specs = panel_specs_from_inputs(panel_inputs)
+    if not specs:
+        raise ValueError("No panel specifications provided")
+
+    segments, roof_polygons, roof_area, _ = _prepare_segments(faces)
+    if not segments:
+        raise ValueError("有効な屋根ポリゴンが見つかりませんでした。")
+
+    density = DENSITY_PROFILES.get("標準")
+    min_walkway = max(min_walkway, 0.0)
+    orientation_options = (
+        [orientation_mode]
+        if orientation_mode in {"portrait", "landscape"}
+        else ["portrait", "landscape"]
+    )
+
+    def build_limits() -> Dict[int, Optional[int]]:
+        if max_per_face is None:
+            return {}
+        return {segment.segment_id: max_per_face for segment in segments}
+
+    best_orientation = orientation_options[0]
+    best_layout = None
+    best_mix: Dict[int, int] = {}
+    best_dc_kw = -1.0
+
+    for orientation in orientation_options:
+        layout = fill_segments(
+            segments=segments,
+            specs=specs,
+            density=density,
+            min_walkway=min_walkway,
+            max_total=max_total,
+            max_per_face=build_limits(),
+            orientation=orientation,
+        )
+        mix = aggregate_mix(specs, layout.placements)
+        dc_kw = sum(specs[idx].watt * count for idx, count in mix.items()) / 1000.0
+        if dc_kw > best_dc_kw:
+            best_dc_kw = dc_kw
+            best_orientation = orientation
+            best_layout = layout
+            best_mix = mix
+
+    assert best_layout is not None
+    placements = list(best_layout.placements)
+    return specs, placements, best_mix, best_orientation, roof_polygons, roof_area, best_dc_kw
+
+
+def _resolve_max_limit(max_per_face: Optional[Union[int, Dict[str, int]]]) -> Optional[int]:
+    if isinstance(max_per_face, int):
+        return max_per_face
+    if isinstance(max_per_face, dict):
+        numeric = [value for value in max_per_face.values() if isinstance(value, int)]
+        if numeric:
+            return min(numeric)
+    return None
+
+
+@app.post(
+    "/image/ortho",
+    response_model=OrthoImageResponse,
+    responses={502: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+)
+def generate_orthophoto(request: OrthoImageRequest) -> OrthoImageResponse:
+    try:
+        api_key = _get_api_key()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    analysis = analyze_roof(api_key, request.lat, request.lng)
+    if analysis is None:
+        raise HTTPException(status_code=404, detail=COVERAGE_UNAVAILABLE_MESSAGE)
+
+    rotated_image = _pil_from_bgr(analysis.rotated_image)
+    original_width, original_height = rotated_image.size
+    target_size = request.square_px
+    if target_size != original_width:
+        resized_image = rotated_image.resize((target_size, target_size))
+        scale_x = target_size / original_width
+        scale_y = target_size / original_height
+    else:
+        resized_image = rotated_image
+        scale_x = scale_y = 1.0
+
+    polygon_rotated = list(analysis.rotated_polygon.exterior.coords)[:-1]
+    scaled_polygon = _scale_polygon(polygon_rotated, scale_x, scale_y)
+
+    width = analysis.original_image.shape[1]
+    height = analysis.original_image.shape[0]
+    polygon_latlng = [
+        [lng, lat]
+        for lat, lng in polygon_pixels_to_latlng(
+            analysis.lat,
+            analysis.lng,
+            STATIC_MAP_ZOOM,
+            STATIC_MAP_SCALE,
+            width,
+            height,
+            list(analysis.original_polygon.exterior.coords)[:-1],
+        )
+    ]
+
+    image_b64 = encode_image(resized_image.convert("RGB"))
+    normalized_orientation = (analysis.orientation + 180.0) % 180.0
+
+    return OrthoImageResponse(
+        image_png_base64=image_b64,
+        m_per_px=round(analysis.mpp, 6),
+        orientation_deg=round(float(normalized_orientation), 2),
+        roof_polygon=scaled_polygon,
+        roof_polygon_latlng=polygon_latlng,
+        confidence=round(analysis.confidence, 3),
+        attribution=list(DEFAULT_ATTRIBUTION),
+    )
+
+
+@app.post(
+    "/roof/segment",
+    response_model=RoofSegmentResponse,
+    responses={502: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+)
+def segment_roof_faces(request: RoofSegmentRequest) -> RoofSegmentResponse:
+    try:
+        api_key = _get_api_key()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    analysis = analyze_roof(api_key, request.lat, request.lng)
+    if analysis is None:
+        raise HTTPException(status_code=404, detail=COVERAGE_UNAVAILABLE_MESSAGE)
+
+    mask_image = Image.fromarray(analysis.rotated_mask)
+    mask_b64 = encode_image(mask_image.convert("L"))
+
+    polygon_rotated = [[float(x), float(y)] for x, y in list(analysis.rotated_polygon.exterior.coords)[:-1]]
+    width = analysis.original_image.shape[1]
+    height = analysis.original_image.shape[0]
+    polygon_latlng = [
+        [lng, lat]
+        for lat, lng in polygon_pixels_to_latlng(
+            analysis.lat,
+            analysis.lng,
+            STATIC_MAP_ZOOM,
+            STATIC_MAP_SCALE,
+            width,
+            height,
+            list(analysis.original_polygon.exterior.coords)[:-1],
+        )
+    ]
+
+    face_area = float(analysis.rotated_polygon.area) * (analysis.mpp ** 2)
+    face = RoofFaceOutput(
+        mask_png_base64=mask_b64,
+        polygon=polygon_rotated,
+        polygon_latlng=polygon_latlng,
+        azimuth_deg=round((analysis.orientation + 360.0) % 360.0, 2),
+        tilt_rel=0.0,
+        area_m2=round(face_area, 2),
+    )
+
+    return RoofSegmentResponse(
+        faces=[face],
+        confidence=round(analysis.confidence, 3),
+        attribution=list(DEFAULT_ATTRIBUTION),
+    )
+
+
+@app.post(
+    "/layout/optimize",
+    response_model=LayoutOptimizeResponse,
+    responses={400: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
+)
+def optimize_layout(request: LayoutOptimizeRequest) -> LayoutOptimizeResponse:
+    if not request.faces:
+        raise HTTPException(status_code=400, detail="屋根面が指定されていません。")
+    if not request.panels:
+        raise HTTPException(status_code=400, detail="パネル仕様が指定されていません。")
+
+    try:
+        specs, placements, mix, orientation, roof_polygons, roof_area, dc_kw = _optimize_layout(
+            request.faces,
+            request.panels,
+            request.orientation_mode,
+            request.max_total,
+            request.max_per_face,
+            request.min_walkway_m,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    mix_entries = [
+        PanelMixEntry(spec=PanelSpecInput(**spec.original), count=mix.get(spec.index, 0))
+        for spec in specs
+        if mix.get(spec.index, 0) > 0
+    ]
+
+    result = FallbackPanelResult(
+        orientation_used=orientation,
+        dc_kw=round(dc_kw, 3),
+        mix=mix_entries,
+    )
+
+    image_b64 = render_layout(roof_polygons, placements, specs)
+    confidence = 1.0 if placements else 0.5
+
+    return LayoutOptimizeResponse(
+        result=result,
+        image_png_base64=image_b64,
+        confidence=confidence,
+        roof_area_m2=round(roof_area, 2),
+        dc_kw=round(dc_kw, 3),
+        attribution=list(DEFAULT_ATTRIBUTION),
+    )
+
+
+@app.post(
+    "/design",
+    response_model=DesignPipelineResponse,
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
+)
+def integrated_design(request: SolarDesignRequest) -> DesignPipelineResponse:
+    if request.lat is None or request.lng is None:
+        raise HTTPException(status_code=400, detail="緯度経度が必要です。")
+    if not request.panels:
+        raise HTTPException(status_code=400, detail="パネル仕様が指定されていません。")
+
+    try:
+        api_key = _get_api_key()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    analysis = analyze_roof(api_key, request.lat, request.lng)
+    if analysis is None:
+        raise HTTPException(status_code=404, detail=COVERAGE_UNAVAILABLE_MESSAGE)
+
+    polygon_latlng = [
+        [lng, lat]
+        for lat, lng in polygon_pixels_to_latlng(
+            analysis.lat,
+            analysis.lng,
+            STATIC_MAP_ZOOM,
+            STATIC_MAP_SCALE,
+            analysis.original_image.shape[1],
+            analysis.original_image.shape[0],
+            list(analysis.original_polygon.exterior.coords)[:-1],
+        )
+    ]
+
+    mask_image = Image.fromarray(analysis.rotated_mask)
+    mask_b64 = encode_image(mask_image.convert("L"))
+    face_area = float(analysis.rotated_polygon.area) * (analysis.mpp ** 2)
+    face_output = RoofFaceOutput(
+        mask_png_base64=mask_b64,
+        polygon=[[float(x), float(y)] for x, y in list(analysis.rotated_polygon.exterior.coords)[:-1]],
+        polygon_latlng=polygon_latlng,
+        azimuth_deg=round((analysis.orientation + 360.0) % 360.0, 2),
+        tilt_rel=0.0,
+        area_m2=round(face_area, 2),
+    )
+
+    face_inputs = [
+        RoofFaceInput(
+            polygon=polygon_latlng,
+            azimuth_deg=face_output.azimuth_deg,
+            tilt_rel=face_output.tilt_rel,
+            area_m2=face_output.area_m2,
+        )
+    ]
+
+    max_limit = _resolve_max_limit(request.max_per_face)
+
+    try:
+        specs, placements, mix, orientation, roof_polygons, roof_area, dc_kw = _optimize_layout(
+            face_inputs,
+            request.panels,
+            request.orientation_mode,
+            request.max_total,
+            max_limit,
+            request.min_walkway_m,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    mix_entries = [
+        PanelMixEntry(spec=PanelSpecInput(**spec.original), count=mix.get(spec.index, 0))
+        for spec in specs
+        if mix.get(spec.index, 0) > 0
+    ]
+
+    result = FallbackPanelResult(
+        orientation_used=orientation,
+        dc_kw=round(dc_kw, 3),
+        mix=mix_entries,
+    )
+
+    image_b64 = render_layout(roof_polygons, placements, specs)
+    layout_confidence = 1.0 if placements else 0.5
+    combined_confidence = round(min(1.0, (analysis.confidence + layout_confidence) / 2.0), 3)
+
+    return DesignPipelineResponse(
+        faces=[face_output],
+        result=result,
+        image_png_base64=image_b64,
+        confidence=combined_confidence,
+        dc_kw=round(dc_kw, 3),
+        attribution=list(DEFAULT_ATTRIBUTION),
+    )
+
 
 @app.post(
     "/solar/design",
@@ -249,3 +649,60 @@ def fetch_roof_from_static_map(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return RoofDetectionResponse(**result)
+@app.post(
+    "/image/ortho",
+    response_model=OrthoImageResponse,
+    responses={502: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+)
+def generate_orthophoto(request: OrthoImageRequest) -> OrthoImageResponse:
+    try:
+        api_key = _get_api_key()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    analysis = analyze_roof(api_key, request.lat, request.lng)
+    if analysis is None:
+        raise HTTPException(status_code=404, detail=COVERAGE_UNAVAILABLE_MESSAGE)
+
+    rotated_image = _pil_from_bgr(analysis.rotated_image)
+    original_width, original_height = rotated_image.size
+    target_size = request.square_px
+    if target_size != original_width:
+        resized_image = rotated_image.resize((target_size, target_size))
+        scale_x = target_size / original_width
+        scale_y = target_size / original_height
+    else:
+        resized_image = rotated_image
+        scale_x = scale_y = 1.0
+
+    polygon_rotated = list(analysis.rotated_polygon.exterior.coords)[:-1]
+    scaled_polygon = _scale_polygon(polygon_rotated, scale_x, scale_y)
+
+    width = analysis.original_image.shape[1]
+    height = analysis.original_image.shape[0]
+    polygon_latlng = [
+        [lng, lat]
+        for lat, lng in polygon_pixels_to_latlng(
+            analysis.lat,
+            analysis.lng,
+            STATIC_MAP_ZOOM,
+            STATIC_MAP_SCALE,
+            width,
+            height,
+            list(analysis.original_polygon.exterior.coords)[:-1],
+        )
+    ]
+
+    image_b64 = encode_image(resized_image.convert("RGB"))
+    normalized_orientation = (analysis.orientation + 180.0) % 180.0
+
+    return OrthoImageResponse(
+        image_png_base64=image_b64,
+        m_per_px=round(analysis.mpp, 6),
+        orientation_deg=round(float(normalized_orientation), 2),
+        roof_polygon=scaled_polygon,
+        roof_polygon_latlng=polygon_latlng,
+        confidence=round(analysis.confidence, 3),
+        attribution=list(DEFAULT_ATTRIBUTION),
+    )
+
