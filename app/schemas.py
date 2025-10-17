@@ -28,6 +28,7 @@ class SolarDesignRequest(BaseModel):
         False,
         description="When true, always use Solar API dataLayers instead of buildingInsights",
     )
+    debug: bool = Field(False, description="When true, include debug imagery in fallback responses")
 
     @validator("panels")
     def validate_panels(cls, value: List[PanelSpecInput]) -> List[PanelSpecInput]:
@@ -79,9 +80,109 @@ class ErrorResponse(BaseModel):
     detail: str
 
 
+class PanelPlacementGeometry(BaseModel):
+    spec: PanelSpecInput
+    polygon_px: List[List[float]] = Field(default_factory=list)
+    polygon_m: List[List[float]] = Field(default_factory=list)
+
+
+class FallbackPanelResult(BaseModel):
+    orientation_used: Optional[str] = None
+    dc_kw: Optional[float] = None
+    mix: List[PanelMixEntry] = Field(default_factory=list)
+    count: int = 0
+    portrait_count: int = 0
+    landscape_count: int = 0
+    auto_count: int = 0
+    panels: List[PanelPlacementGeometry] = Field(default_factory=list)
+    confidence: Optional[float] = None
+
+
 class RoofDetectionResponse(BaseModel):
     roof_detected: bool
+    confidence: Optional[float] = None
+    orientation_deg: Optional[float] = None
     roof_area_m2: Optional[float] = None
-    roof_polygon: List[List[int]] = Field(default_factory=list)
-    image_overlay_base64: Optional[str] = None
+    panel_counts: Optional[int] = None
+    dc_kw: Optional[float] = None
+    roof_polygon: List[List[float]] = Field(default_factory=list)
+    roof_polygon_latlng: Optional[List[List[float]]] = None
+    result: Optional[FallbackPanelResult] = None
+    image_png_base64: Optional[str] = None
+    debug_images: Optional[Dict[str, str]] = None
+    fallback_reason: Optional[str] = None
     message: Optional[str] = None
+    attribution: Optional[List[str]] = None
+
+
+class OrthoImageRequest(BaseModel):
+    lat: float
+    lng: float
+    zoom: int = Field(21, ge=0, le=21)
+    square_px: int = Field(1024, gt=0, le=2048)
+
+
+class OrthoImageResponse(BaseModel):
+    image_png_base64: str
+    m_per_px: float
+    orientation_deg: float
+    roof_polygon: List[List[float]] = Field(default_factory=list)
+    roof_polygon_latlng: List[List[float]] = Field(default_factory=list)
+    confidence: float
+    attribution: List[str] = Field(default_factory=list)
+
+
+class RoofFaceOutput(BaseModel):
+    mask_png_base64: Optional[str] = None
+    polygon: List[List[float]] = Field(default_factory=list)
+    polygon_latlng: List[List[float]] = Field(default_factory=list)
+    azimuth_deg: float
+    tilt_rel: float
+    area_m2: float
+
+
+class RoofSegmentRequest(BaseModel):
+    image_png_base64: str
+    lat: float
+    lng: float
+    use_osm_mask: bool = True
+
+
+class RoofSegmentResponse(BaseModel):
+    faces: List[RoofFaceOutput]
+    confidence: float
+    attribution: List[str] = Field(default_factory=list)
+
+
+class RoofFaceInput(BaseModel):
+    polygon: List[List[float]]
+    azimuth_deg: Optional[float] = None
+    tilt_rel: Optional[float] = None
+    area_m2: Optional[float] = None
+
+
+class LayoutOptimizeRequest(BaseModel):
+    faces: List[RoofFaceInput]
+    panels: List[PanelSpecInput]
+    orientation_mode: str = Field("auto", regex="^(portrait|landscape|auto)$")
+    max_per_face: Optional[int] = Field(None, ge=1)
+    max_total: Optional[int] = Field(None, ge=1)
+    min_walkway_m: float = Field(0.4, ge=0)
+
+
+class LayoutOptimizeResponse(BaseModel):
+    result: FallbackPanelResult
+    image_png_base64: str
+    confidence: float
+    roof_area_m2: float
+    dc_kw: float
+    attribution: List[str] = Field(default_factory=list)
+
+
+class DesignPipelineResponse(BaseModel):
+    faces: List[RoofFaceOutput]
+    result: FallbackPanelResult
+    image_png_base64: str
+    confidence: float
+    dc_kw: float
+    attribution: List[str] = Field(default_factory=list)
