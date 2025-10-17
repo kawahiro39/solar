@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import base64
 import logging
+import re
 from typing import Dict, List, Optional, Tuple, Union
+from urllib.parse import parse_qs, urlparse
 
+import httpx
 import requests
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 from PIL import Image
 from shapely.geometry import Polygon
@@ -32,10 +37,17 @@ from .schemas import (
     DesignPipelineResponse,
     LayoutOptimizeRequest,
     LayoutOptimizeResponse,
+    LayoutPanelsRequest,
+    LayoutPanelsResponse,
+    LayoutPanelsSummary,
+    LayoutPanelsSummaryOption,
+    SquareImageCenter,
     OrthoImageRequest,
     OrthoImageResponse,
     PanelMixEntry,
     PanelSpecInput,
+    SquareImageRequest,
+    SquareImageResponse,
     FallbackPanelResult,
     RoofDetectionResponse,
     RoofFaceInput,
@@ -53,13 +65,165 @@ from .solar_service import (
     SolarDesignEngine,
     _get_api_key,
 )
-from .geo import polygon_latlng_to_local, polygon_pixels_to_latlng
+from .geo import meters_per_pixel as compute_mpp, polygon_latlng_to_local, polygon_pixels_to_latlng
+
+ALLOWED_CORS_ORIGINS = [
+    "https://solar-nova.online",
+    "https://www.solar-nova.online",
+]
+
+STATIC_MAP_ENDPOINT = "https://maps.googleapis.com/maps/api/staticmap"
+GMAPS_AT_PATTERN = re.compile(
+    r"@(?P<lat>-?\d+(?:\.\d+)?),(?P<lng>-?\d+(?:\.\d+)?),(?P<zoom>\d+(?:\.\d+)?)z"
+)
+GMAPS_34_PATTERN = re.compile(
+    r"!3d(?P<lat>-?\d+(?:\.\d+)?)!4d(?P<lng>-?\d+(?:\.\d+)?)"
+)
+MAX_ERROR_DETAIL_LENGTH = 200
 
 app = FastAPI(title="Solar Design Service", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_CORS_ORIGINS,
+    allow_methods=["POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+    allow_credentials=False,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_ATTRIBUTION = ["© OpenStreetMap contributors", "Imagery © Google"]
+
+
+def _truncate_detail(message: str) -> str:
+    trimmed = message.strip()
+    if len(trimmed) <= MAX_ERROR_DETAIL_LENGTH:
+        return trimmed
+    return trimmed[:MAX_ERROR_DETAIL_LENGTH]
+
+
+def _parse_coordinate_string(value: str) -> Optional[Tuple[float, float]]:
+    matches = re.findall(r"-?\d+(?:\.\d+)?", value)
+    if len(matches) < 2:
+        return None
+    try:
+        return float(matches[0]), float(matches[1])
+    except ValueError:
+        return None
+
+
+def _extract_zoom_from_query(query: Dict[str, List[str]]) -> Optional[float]:
+    for key in ("zoom", "z", "level"):
+        if key in query and query[key]:
+            candidate = query[key][0]
+            try:
+                return float(candidate)
+            except ValueError:
+                continue
+    return None
+
+
+def _parse_gmaps_url(url: str) -> Tuple[float, float, float]:
+    normalized = url.strip()
+    match = GMAPS_AT_PATTERN.search(normalized)
+    if match:
+        lat = float(match.group("lat"))
+        lng = float(match.group("lng"))
+        zoom = float(match.group("zoom"))
+        if not 0 <= zoom <= 21:
+            raise ValueError("Zoom level must be between 0 and 21.")
+        return lat, lng, zoom
+
+    parsed = urlparse(normalized)
+    query = parse_qs(parsed.query)
+    zoom = _extract_zoom_from_query(query)
+
+    coordinate = None
+    if query:
+        coordinate = _parse_coordinate_string(
+            next((value for key in ("ll", "center", "q") if (value := query.get(key))), [""])[0]
+        )
+        if coordinate is None:
+            lat_candidate = query.get("lat")
+            lng_candidate = query.get("lng")
+            if lat_candidate and lng_candidate:
+                try:
+                    coordinate = float(lat_candidate[0]), float(lng_candidate[0])
+                except ValueError:
+                    coordinate = None
+
+    if coordinate is None:
+        alt_match = GMAPS_34_PATTERN.search(normalized)
+        if alt_match:
+            coordinate = float(alt_match.group("lat")), float(alt_match.group("lng"))
+
+    if coordinate is None:
+        raise ValueError("Google Maps URL から位置情報を抽出できませんでした。")
+
+    if zoom is None:
+        zoom = 20.0
+    if not 0 <= zoom <= 21:
+        raise ValueError("Zoom level must be between 0 and 21.")
+
+    return coordinate[0], coordinate[1], zoom
+
+
+async def _fetch_static_map_image(
+    api_key: str,
+    lat: float,
+    lng: float,
+    zoom: int,
+    size_px: int,
+    scale: int,
+    maptype: str,
+) -> bytes:
+    params = {
+        "center": f"{lat},{lng}",
+        "zoom": str(zoom),
+        "size": f"{size_px}x{size_px}",
+        "scale": str(scale),
+        "maptype": maptype,
+        "format": "png",
+        "key": api_key,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(STATIC_MAP_ENDPOINT, params=params)
+    except httpx.HTTPError as exc:
+        logger.warning("Static map request failed: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail=_truncate_detail("衛星画像の取得に失敗しました。時間をおいて再実行してください。"),
+        ) from exc
+
+    if response.status_code == 200 and response.content:
+        return response.content
+
+    if 400 <= response.status_code < 500:
+        logger.info(
+            "Static map request returned client error %s: %s",
+            response.status_code,
+            response.text,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=_truncate_detail("Google Maps Static API リクエストが無効です。パラメータを確認してください。"),
+        )
+
+    logger.error(
+        "Static map provider returned status %s: %s",
+        response.status_code,
+        response.text,
+    )
+    raise HTTPException(
+        status_code=502,
+        detail=_truncate_detail("衛星画像プロバイダからエラーが返されました。再度お試しください。"),
+    )
+
+
+def _build_data_uri(image_bytes: bytes) -> str:
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
 
 
 def _pil_from_bgr(image: np.ndarray) -> Image.Image:
@@ -179,6 +343,95 @@ def _resolve_max_limit(max_per_face: Optional[Union[int, Dict[str, int]]]) -> Op
         if numeric:
             return min(numeric)
     return None
+
+
+@app.post(
+    "/square_image",
+    response_model=SquareImageResponse,
+    responses={400: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
+)
+async def generate_square_image(request: SquareImageRequest) -> SquareImageResponse:
+    try:
+        api_key = _get_api_key()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=_truncate_detail(str(exc))) from exc
+
+    try:
+        lat, lng, zoom = _parse_gmaps_url(request.gmaps_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=_truncate_detail(str(exc))) from exc
+
+    zoom_int = int(round(zoom))
+    zoom_int = max(0, min(21, zoom_int))
+
+    image_bytes = await _fetch_static_map_image(
+        api_key=api_key,
+        lat=lat,
+        lng=lng,
+        zoom=zoom_int,
+        size_px=request.square_size_px,
+        scale=request.scale,
+        maptype=request.maptype,
+    )
+
+    data_uri = _build_data_uri(image_bytes)
+    meters_per_px = compute_mpp(lat, zoom_int, request.scale)
+
+    return SquareImageResponse(
+        image_data_uri=data_uri,
+        center=SquareImageCenter(lat=lat, lng=lng, zoom=float(zoom_int)),
+        square_size_px=request.square_size_px,
+        meters_per_pixel=round(meters_per_px, 6),
+    )
+
+
+@app.post(
+    "/layout_panels",
+    response_model=LayoutPanelsResponse,
+    responses={400: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
+)
+def layout_panels(request: LayoutPanelsRequest) -> LayoutPanelsResponse:
+    try:
+        specs, placements, mix, _orientation, roof_polygons, _roof_area, dc_kw = _optimize_layout(
+            request.roofs,
+            request.panels,
+            request.orientation_mode,
+            request.max_total,
+            request.max_per_face,
+            request.min_walkway_m,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=_truncate_detail(str(exc))) from exc
+
+    summary_options: List[LayoutPanelsSummaryOption] = []
+    total_panels = 0
+    for spec in specs:
+        count = mix.get(spec.index, 0)
+        if count <= 0:
+            continue
+        total_panels += count
+        summary_options.append(
+            LayoutPanelsSummaryOption(
+                panel=PanelSpecInput(**spec.original),
+                count=count,
+                dc_kw=round(spec.watt * count / 1000.0, 3),
+            )
+        )
+
+    total_kw = round(dc_kw, 3)
+
+    try:
+        image_data_uri = render_layout(roof_polygons, placements, specs)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=_truncate_detail(str(exc))) from exc
+
+    summary = LayoutPanelsSummary(
+        total_panels=total_panels,
+        total_kw=total_kw,
+        by_option=summary_options,
+    )
+
+    return LayoutPanelsResponse(layout_image_data_uri=image_data_uri, summary=summary)
 
 
 @app.post(

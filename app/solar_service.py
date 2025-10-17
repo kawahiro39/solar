@@ -435,10 +435,11 @@ def _polygon_lonlat_to_meters(
 
 
 def _get_api_key() -> str:
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "GOOGLE_API_KEY environment variable is not set. Cloud Run 環境変数または Secret Manager を設定してください。"
-        )
-    return api_key
+    for env_name in ("GOOGLE_MAPS_API_KEY", "GOOGLE_API_KEY"):
+        api_key = os.getenv(env_name)
+        if api_key:
+            return api_key
+    raise RuntimeError(
+        "GOOGLE_MAPS_API_KEY environment variable is not set. Cloud Run 環境変数または Secret Manager を設定してください。"
+    )
 
