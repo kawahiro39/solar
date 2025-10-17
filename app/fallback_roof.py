@@ -17,7 +17,9 @@ from .schemas import FallbackPanelResult, PanelMixEntry, PanelSpecInput
 from .geo import (
     meters_per_pixel as compute_mpp,
     polygon_pixels_to_latlng,
+    latlng_to_pixels,
 )
+from .buildings import fetch_osm_building_polygon
 
 
 STATIC_MAP_ENDPOINT = "https://maps.googleapis.com/maps/api/staticmap"
@@ -96,6 +98,25 @@ def build_roof_mask(image: np.ndarray) -> np.ndarray:
     return closed
 
 
+def _initial_angle_candidates(angles: Sequence[float], max_candidates: int = 3) -> List[float]:
+    histogram, bin_edges = np.histogram(angles, bins=36, range=(-90, 90))
+    order = np.argsort(histogram)[::-1]
+    candidates: List[float] = []
+    for idx in order:
+        count = histogram[idx]
+        if count <= 0:
+            continue
+        center = (bin_edges[idx] + bin_edges[idx + 1]) / 2.0
+        if any(abs(((center - existing) + 90) % 180 - 90) < 5.0 for existing in candidates):
+            continue
+        candidates.append(center)
+        if len(candidates) >= max_candidates:
+            break
+    if not candidates:
+        candidates.append(0.0)
+    return candidates
+
+
 def estimate_orientation(mask: np.ndarray) -> float:
     edges = cv2.Canny(mask, 50, 150)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60, minLineLength=40, maxLineGap=10)
@@ -116,6 +137,37 @@ def estimate_orientation(mask: np.ndarray) -> float:
         return 0.0
 
     normalized = [((angle + 90) % 180) - 90 for angle in angles]
+    candidates = _initial_angle_candidates(normalized)
+
+    if len(normalized) >= 2 and len(candidates) >= 1:
+        data = np.array(
+            [[math.cos(math.radians(a)), math.sin(math.radians(a))] for a in normalized],
+            dtype=np.float32,
+        )
+        centers0 = np.array(
+            [[math.cos(math.radians(c)), math.sin(math.radians(c))] for c in candidates],
+            dtype=np.float32,
+        )
+        if centers0.ndim == 2 and centers0.shape[0] >= 1:
+            distances = np.linalg.norm(data[:, None, :] - centers0[None, :, :], axis=2)
+            labels0 = distances.argmin(axis=1).astype(np.int32).reshape(-1, 1)
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1e-3)
+            try:
+                _, labels, centers = cv2.kmeans(
+                    data,
+                    centers0.shape[0],
+                    labels0,
+                    criteria,
+                    10,
+                    cv2.KMEANS_USE_INITIAL_LABELS,
+                )
+                counts = np.bincount(labels.flatten(), minlength=centers.shape[0])
+                dominant_center = centers[int(np.argmax(counts))]
+                dominant_angle = math.degrees(math.atan2(dominant_center[1], dominant_center[0]))
+                return dominant_angle
+            except cv2.error:
+                pass
+
     histogram, bin_edges = np.histogram(normalized, bins=36, range=(-90, 90))
     dominant_index = int(np.argmax(histogram))
     dominant_angle = (bin_edges[dominant_index] + bin_edges[dominant_index + 1]) / 2.0
@@ -153,6 +205,36 @@ def rotate_points(points: np.ndarray, matrix: np.ndarray) -> np.ndarray:
 
 def invert_rotation_matrix(matrix: np.ndarray) -> np.ndarray:
     return cv2.invertAffineTransform(matrix)
+
+
+def merge_small_clusters(mask: np.ndarray, min_ratio: float = 0.05) -> np.ndarray:
+    total = cv2.countNonZero(mask)
+    if total == 0:
+        return mask
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return mask
+
+    threshold = max(1, int(total * min_ratio))
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    if areas.size == 0:
+        return mask
+    largest_label = 1 + int(np.argmax(areas))
+
+    merged = np.zeros_like(mask)
+    for label in range(1, num_labels):
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area >= threshold:
+            merged[labels == label] = 255
+
+    merged[labels == largest_label] = 255
+
+    for label in range(1, num_labels):
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area < threshold:
+            merged[labels == label] = 255
+    return merged
 
 
 def select_main_component(mask: np.ndarray) -> Optional[np.ndarray]:
@@ -243,6 +325,8 @@ class RoofAnalysis:
     lng: float
     original_image: np.ndarray
     sharpened_image: np.ndarray
+    crop_bounds: Tuple[int, int, int, int]
+    crop_offset: Tuple[int, int]
     roof_mask: np.ndarray
     rotated_mask: np.ndarray
     rotated_image: np.ndarray
@@ -265,12 +349,60 @@ def polygon_from_contour(contour: np.ndarray) -> Polygon:
 
 def analyze_roof(api_key: str, lat: float, lng: float) -> Optional[RoofAnalysis]:
     original_image = download_static_map(api_key, lat, lng)
-    sharpened = unsharp_mask(original_image)
-    roof_mask = build_roof_mask(sharpened)
+    mpp = compute_mpp(lat, STATIC_MAP_ZOOM, STATIC_MAP_SCALE)
+    sharpened_full = unsharp_mask(original_image)
+
+    height, width = original_image.shape[:2]
+    crop_bounds = (0, 0, width, height)
+    crop_offset = (0, 0)
+
+    building_polygon = fetch_osm_building_polygon(lat, lng)
+    building_mask: Optional[np.ndarray] = None
+
+    if building_polygon is not None and not building_polygon.is_empty:
+        polygon_coords_latlng = [(coord[1], coord[0]) for coord in building_polygon.exterior.coords]
+        pixel_points = latlng_to_pixels(
+            lat,
+            lng,
+            STATIC_MAP_ZOOM,
+            STATIC_MAP_SCALE,
+            width,
+            height,
+            polygon_coords_latlng,
+        )
+        polygon_array = np.array(pixel_points, dtype=np.float32)
+        if len(polygon_array) >= 3:
+            building_mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.fillPoly(building_mask, [np.round(polygon_array).astype(np.int32)], 255)
+            pad_px = max(1, int(round(5.0 / max(mpp, 1e-6))))
+            xs = polygon_array[:, 0]
+            ys = polygon_array[:, 1]
+            minx = max(0, int(np.floor(xs.min()) - pad_px))
+            maxx = min(width, int(np.ceil(xs.max()) + pad_px))
+            miny = max(0, int(np.floor(ys.min()) - pad_px))
+            maxy = min(height, int(np.ceil(ys.max()) + pad_px))
+            if maxx - minx > 10 and maxy - miny > 10:
+                crop_bounds = (minx, miny, maxx, maxy)
+                crop_offset = (minx, miny)
+
+    minx, miny, maxx, maxy = crop_bounds
+    cropped_sharpened = sharpened_full[miny:maxy, minx:maxx].copy()
+    roof_mask = build_roof_mask(cropped_sharpened)
+    if building_mask is not None:
+        building_crop = building_mask[miny:maxy, minx:maxx]
+        roof_mask = cv2.bitwise_and(roof_mask, building_crop)
+
+    if cv2.countNonZero(roof_mask) == 0:
+        if building_mask is not None:
+            roof_mask = building_mask[miny:maxy, minx:maxx]
+        else:
+            return None
+
+    roof_mask = merge_small_clusters(roof_mask)
     orientation = estimate_orientation(roof_mask)
 
     rotated_mask, rotation_matrix = rotate_image(roof_mask, -orientation, flags=cv2.INTER_NEAREST)
-    rotated_image, _ = rotate_image(sharpened, -orientation)
+    rotated_image, _ = rotate_image(cropped_sharpened, -orientation)
     component = select_main_component(rotated_mask)
     if component is None:
         return None
@@ -282,18 +414,23 @@ def analyze_roof(api_key: str, lat: float, lng: float) -> Optional[RoofAnalysis]
 
     inverse_matrix = invert_rotation_matrix(rotation_matrix)
     original_points = rotate_points(ortho_contour.reshape(-1, 2), inverse_matrix)
+    if original_points.size == 0:
+        return None
+    original_points[:, 0] += crop_offset[0]
+    original_points[:, 1] += crop_offset[1]
     original_polygon = Polygon(original_points).buffer(0)
     if original_polygon.is_empty:
         return None
 
-    mpp = compute_mpp(lat, STATIC_MAP_ZOOM, STATIC_MAP_SCALE)
     confidence = compute_confidence(component, rotated_polygon)
 
     return RoofAnalysis(
         lat=lat,
         lng=lng,
         original_image=original_image,
-        sharpened_image=sharpened,
+        sharpened_image=cropped_sharpened,
+        crop_bounds=crop_bounds,
+        crop_offset=crop_offset,
         roof_mask=roof_mask,
         rotated_mask=rotated_mask,
         rotated_image=rotated_image,
@@ -419,17 +556,18 @@ def draw_result(
     draw = ImageDraw.Draw(overlay, "RGBA")
 
     roof_coords = [(float(x), float(y)) for x, y in roof_polygon.exterior.coords]
-    roof_fill = (102, 205, 255, 120)
-    roof_outline = (64, 112, 214, 220)
-    draw.polygon(roof_coords, fill=roof_fill if fill_roof else None, outline=roof_outline)
-    if not fill_roof:
-        draw.line(roof_coords + [roof_coords[0]], fill=roof_outline, width=2)
+    roof_fill = (0, 255, 255, int(0.3 * 255)) if fill_roof else None
+    roof_outline = (0, 255, 255, 200)
+    if fill_roof:
+        draw.polygon(roof_coords, fill=roof_fill)
+    draw.line(roof_coords + [roof_coords[0]], fill=roof_outline, width=2)
 
-    panel_fill = (255, 255, 255, 180)
-    panel_outline = (220, 32, 32, 255)
+    panel_fill = (255, 255, 255, 230)
+    panel_outline = (255, 0, 0, 255)
     for placement in placements:
         coords = [(float(x), float(y)) for x, y in placement.rectangle.exterior.coords]
-        draw.polygon(coords, fill=panel_fill, outline=panel_outline)
+        draw.polygon(coords, fill=panel_fill)
+        draw.line(coords + [coords[0]], fill=panel_outline, width=1)
 
     combined = Image.alpha_composite(pil_image, overlay)
     return encode_image(combined.convert("RGB"))
@@ -591,8 +729,26 @@ def run_fallback_detection(
 
     normalized_orientation = (orientation + 180.0) % 180.0
 
+    offset_x, offset_y = analysis.crop_offset
+    crop_minx, crop_miny, crop_maxx, crop_maxy = analysis.crop_bounds
+    display_polygon = original_polygon
+    display_placements = placements
+    display_image = sharpened
+    if (offset_x, offset_y) != (0, 0) or (crop_minx, crop_miny) != (0, 0) or (
+        crop_maxx != analysis.original_image.shape[1]
+        or crop_maxy != analysis.original_image.shape[0]
+    ):
+        display_polygon = affinity.translate(original_polygon, xoff=-offset_x, yoff=-offset_y)
+        display_placements = [
+            FallbackPanelPlacement(
+                spec=placement.spec,
+                rectangle=affinity.translate(placement.rectangle, xoff=-offset_x, yoff=-offset_y),
+            )
+            for placement in placements
+        ]
+
     fill_roof = confidence >= 0.6
-    image_b64 = draw_result(sharpened, original_polygon, placements, fill_roof=fill_roof)
+    image_b64 = draw_result(display_image, display_polygon, display_placements, fill_roof=fill_roof)
 
     result_model = FallbackPanelResult(
         orientation_used=orientation_used,

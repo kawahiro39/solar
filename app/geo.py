@@ -74,6 +74,30 @@ def polygon_pixels_to_latlng(
     return pixels_to_latlng(lat, lng, zoom, scale, width, height, list(polygon))
 
 
+def latlng_to_pixels(
+    lat: float,
+    lng: float,
+    zoom: int,
+    scale: int,
+    width: int,
+    height: int,
+    latlng_points: Sequence[Tuple[float, float]],
+) -> List[Tuple[float, float]]:
+    """Convert latitude/longitude pairs to image pixel coordinates."""
+
+    center_world_x, center_world_y = latlng_to_world(lat, lng, zoom)
+    half_width = width / 2.0
+    half_height = height / 2.0
+
+    pixels: List[Tuple[float, float]] = []
+    for point_lat, point_lng in latlng_points:
+        world_x, world_y = latlng_to_world(point_lat, point_lng, zoom)
+        px = (world_x - center_world_x) * scale + half_width
+        py = (world_y - center_world_y) * scale + half_height
+        pixels.append((px, py))
+    return pixels
+
+
 def meters_per_pixel(lat: float, zoom: int, scale: int) -> float:
     return (
         math.cos(math.radians(lat))
