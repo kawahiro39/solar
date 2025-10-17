@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import base64
 import logging
 from typing import Dict, List, Optional, Union
 
-import cv2
-import numpy as np
 import requests
 
 from fastapi import FastAPI, HTTPException
 from shapely.geometry import Polygon
 
+from .fallback_roof import run_fallback_detection
 from .imaging import render_layout
+from .panel_layout import PanelSpec
 from .schemas import (
     ErrorResponse,
     PanelMixEntry,
@@ -32,10 +31,6 @@ from .solar_service import (
 app = FastAPI(title="Solar Design Service", version="1.0.0")
 
 logger = logging.getLogger(__name__)
-
-PIXEL_AREA_M2 = 0.014
-MIN_CONTOUR_AREA = 500
-
 
 @app.post(
     "/solar/design",
@@ -92,7 +87,7 @@ def design_solar_system(
                 )
                 if building_insights_error and building_insights_error.status_code == 404:
                     try:
-                        return fetch_roof_from_static_map(lat, lng)
+                        return fetch_roof_from_static_map(lat, lng, specs, request)
                     except HTTPException:
                         raise
                     except Exception as fallback_error:
@@ -104,7 +99,7 @@ def design_solar_system(
                 except SolarApiError as fallback_exc:
                     if fallback_exc.status_code == 404:
                         try:
-                            return fetch_roof_from_static_map(lat, lng)
+                            return fetch_roof_from_static_map(lat, lng, specs, request)
                         except HTTPException:
                             raise
                         except Exception as roof_exc:
@@ -117,7 +112,7 @@ def design_solar_system(
     if not segments:
         if data_layers_error and data_layers_error.status_code == 404:
             logger.info("Falling back to roof detection for lat=%s, lng=%s", lat, lng)
-            return fetch_roof_from_static_map(lat, lng)
+            return fetch_roof_from_static_map(lat, lng, specs, request)
         detail_message = (
             COVERAGE_UNAVAILABLE_MESSAGE
             if data_layers_error
@@ -209,73 +204,48 @@ def health_check() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-def fetch_roof_from_static_map(lat: float, lng: float) -> RoofDetectionResponse:
+def fetch_roof_from_static_map(
+    lat: float,
+    lng: float,
+    specs: List[PanelSpec],
+    request: SolarDesignRequest,
+) -> RoofDetectionResponse:
     try:
         api_key = _get_api_key()
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    params = {
-        "center": f"{lat},{lng}",
-        "zoom": 20,
-        "size": "640x640",
-        "maptype": "satellite",
-        "key": api_key,
-    }
+    max_total = request.max_total
+    max_face = None
+    if isinstance(request.max_per_face, int):
+        max_face = request.max_per_face
+    elif isinstance(request.max_per_face, dict):
+        numeric_limits = [value for value in request.max_per_face.values() if isinstance(value, int)]
+        if numeric_limits:
+            max_face = min(numeric_limits)
+
     try:
-        response = requests.get(
-            "https://maps.googleapis.com/maps/api/staticmap", params=params, timeout=30
+        result = run_fallback_detection(
+            api_key=api_key,
+            lat=lat,
+            lng=lng,
+            specs=specs,
+            orientation_mode=request.orientation_mode,
+            max_total=max_total,
+            max_face=max_face,
+            debug=request.debug,
         )
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 502
+        message = (
+            "衛星画像の取得に失敗しました。リクエストを確認してください。"
+            if 400 <= status < 500
+            else "衛星画像の取得に失敗しました。しばらくしてから再度お試しください。"
+        )
+        raise HTTPException(status_code=502, detail=message) from exc
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail="衛星画像の取得に失敗しました。再度お試しください。") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    if response.status_code >= 500:
-        raise HTTPException(status_code=502, detail="衛星画像の取得に失敗しました。しばらくしてから再度お試しください。")
-    if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail="衛星画像の取得に失敗しました。リクエストを確認してください。")
-
-    image_array = np.frombuffer(response.content, dtype=np.uint8)
-    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-    if image is None:
-        return RoofDetectionResponse(
-            roof_detected=False,
-            message="衛星画像から屋根を特定できませんでした。",
-        )
-
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
-
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    significant_contours = [cnt for cnt in contours if cv2.contourArea(cnt) >= MIN_CONTOUR_AREA]
-
-    if not significant_contours:
-        return RoofDetectionResponse(
-            roof_detected=False,
-            message="屋根を特定できませんでした。",
-        )
-
-    roof_contour = max(significant_contours, key=cv2.contourArea)
-    perimeter = cv2.arcLength(roof_contour, True)
-    simplified = cv2.approxPolyDP(roof_contour, 0.02 * perimeter, True)
-    if len(simplified) < 3:
-        simplified = roof_contour
-
-    overlay = image.copy()
-    cv2.drawContours(overlay, [simplified], -1, (0, 0, 255), 2)
-    success, buffer = cv2.imencode(".png", overlay)
-    image_overlay_base64 = None
-    if success:
-        encoded_overlay = base64.b64encode(buffer.tobytes()).decode("ascii")
-        image_overlay_base64 = "data:image/png;base64," + encoded_overlay
-
-    contour_area_px = float(cv2.contourArea(roof_contour))
-    roof_area_m2 = round(contour_area_px * PIXEL_AREA_M2, 2)
-    roof_polygon = [[int(point[0][0]), int(point[0][1])] for point in simplified]
-
-    return RoofDetectionResponse(
-        roof_detected=True,
-        roof_area_m2=roof_area_m2,
-        roof_polygon=roof_polygon,
-        image_overlay_base64=image_overlay_base64,
-    )
+    return RoofDetectionResponse(**result)
