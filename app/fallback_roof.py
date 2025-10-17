@@ -3,17 +3,22 @@ from __future__ import annotations
 import base64
 import math
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 import requests
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from shapely import affinity
 from shapely.geometry import Polygon, box
 
 from .panel_layout import PanelSpec
-from .schemas import FallbackPanelResult, PanelMixEntry, PanelSpecInput
+from .schemas import (
+    FallbackPanelResult,
+    PanelMixEntry,
+    PanelPlacementGeometry,
+    PanelSpecInput,
+)
 from .geo import (
     meters_per_pixel as compute_mpp,
     polygon_pixels_to_latlng,
@@ -31,7 +36,32 @@ STATIC_MAP_SCALE = 2
 @dataclass
 class FallbackPanelPlacement:
     spec: PanelSpec
-    rectangle: Polygon
+    polygon_px: Polygon
+    polygon_m: Polygon
+
+    def translated(self, dx_px: float, dy_px: float, mpp: float) -> "FallbackPanelPlacement":
+        return FallbackPanelPlacement(
+            spec=self.spec,
+            polygon_px=affinity.translate(self.polygon_px, xoff=dx_px, yoff=dy_px),
+            polygon_m=affinity.translate(
+                self.polygon_m,
+                xoff=dx_px * mpp,
+                yoff=dy_px * mpp,
+            ),
+        )
+
+
+@dataclass
+class OrientationSummary:
+    mode: str
+    orientation_label: str
+    placements: List[FallbackPanelPlacement]
+    total_watts: float
+    panel_area_m2: float
+
+    @property
+    def count(self) -> int:
+        return len(self.placements)
 
 
 def panel_specs_from_inputs(inputs: Sequence[PanelSpecInput]) -> List[PanelSpec]:
@@ -347,6 +377,30 @@ def polygon_from_contour(contour: np.ndarray) -> Polygon:
     return polygon
 
 
+def principal_axis_angle(polygon: Polygon) -> float:
+    coords = np.array(polygon.exterior.coords[:-1], dtype=np.float64)
+    if coords.size == 0:
+        return 0.0
+
+    centroid = coords.mean(axis=0)
+    centered = coords - centroid
+    if centered.ndim != 2 or centered.shape[0] < 2:
+        return 0.0
+
+    covariance = np.cov(centered, rowvar=False)
+    if covariance.shape != (2, 2) or not np.isfinite(covariance).all():
+        return 0.0
+
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    index = int(np.argmax(eigenvalues))
+    direction = eigenvectors[:, index]
+    angle = math.degrees(math.atan2(direction[1], direction[0]))
+    angle = (angle + 180.0) % 180.0
+    if angle > 90.0:
+        angle -= 180.0
+    return angle
+
+
 def analyze_roof(api_key: str, lat: float, lng: float) -> Optional[RoofAnalysis]:
     original_image = download_static_map(api_key, lat, lng)
     mpp = compute_mpp(lat, STATIC_MAP_ZOOM, STATIC_MAP_SCALE)
@@ -445,90 +499,155 @@ def analyze_roof(api_key: str, lat: float, lng: float) -> Optional[RoofAnalysis]
     )
 
 
+def _rectangles_overlap(rect: Polygon, others: Sequence[Polygon]) -> bool:
+    for other in others:
+        if rect.intersection(other).area > 1e-6:
+            return True
+    return False
+
+
+def _layout_for_orientation(
+    polygon_px: Polygon,
+    polygon_m: Polygon,
+    axis_angle: float,
+    specs: Sequence[PanelSpec],
+    max_count: Optional[int],
+    orientation_label: str,
+    mpp: float,
+) -> OrientationSummary:
+    centroid = polygon_m.centroid
+    rotated_polygon = affinity.rotate(
+        polygon_m,
+        -axis_angle,
+        origin=(centroid.x, centroid.y),
+    )
+
+    placements_aligned: List[Polygon] = []
+    placement_records: List[Tuple[PanelSpec, Polygon]] = []
+    max_slots = None if max_count is None else max(0, int(max_count))
+
+    minx, miny, maxx, maxy = rotated_polygon.bounds
+    if not all(math.isfinite(val) for val in (minx, miny, maxx, maxy)):
+        return OrientationSummary(orientation_label, orientation_label, [], 0.0, 0.0)
+
+    for spec in sorted(
+        specs,
+        key=lambda s: (s.efficiency, s.area_m2),
+        reverse=True,
+    ):
+        if max_slots is not None and len(placement_records) >= max_slots:
+            break
+
+        width = spec.width_m if orientation_label == "portrait" else spec.height_m
+        height = spec.height_m if orientation_label == "portrait" else spec.width_m
+        gap = max(spec.gap_m, 0.0)
+        step_x = width + gap
+        step_y = height + gap
+        if step_x <= 0 or step_y <= 0:
+            continue
+
+        half_w = width / 2.0
+        half_h = height / 2.0
+        offsets_x = [0.0, step_x / 2.0]
+        offsets_y = [0.0, step_y / 2.0]
+
+        best_local: List[Polygon] = []
+        limit = None if max_slots is None else max_slots - len(placement_records)
+
+        for ox in offsets_x:
+            for oy in offsets_y:
+                current: List[Polygon] = []
+                y = miny + half_h + oy
+                while y + half_h <= maxy + 1e-9:
+                    x = minx + half_w + ox
+                    while x + half_w <= maxx + 1e-9:
+                        if limit is not None and len(current) >= limit:
+                            break
+                        rect = box(x - half_w, y - half_h, x + half_w, y + half_h)
+                        if not rect.within(rotated_polygon):
+                            x += step_x
+                            continue
+                        if _rectangles_overlap(rect, placements_aligned) or _rectangles_overlap(
+                            rect, current
+                        ):
+                            x += step_x
+                            continue
+                        current.append(rect)
+                        x += step_x
+                    if limit is not None and len(current) >= limit:
+                        break
+                    y += step_y
+                if len(current) > len(best_local):
+                    best_local = current
+
+        for rect in best_local:
+            placements_aligned.append(rect)
+            placement_records.append((spec, rect))
+            if max_slots is not None and len(placement_records) >= max_slots:
+                break
+        if max_slots is not None and len(placement_records) >= max_slots:
+            break
+
+    placements: List[FallbackPanelPlacement] = []
+    for spec, rect_aligned in placement_records:
+        rect_metric = affinity.rotate(
+            rect_aligned,
+            axis_angle,
+            origin=(centroid.x, centroid.y),
+        )
+        rect_px = affinity.scale(rect_metric, 1.0 / mpp, 1.0 / mpp, origin=(0.0, 0.0))
+        placements.append(
+            FallbackPanelPlacement(
+                spec=spec,
+                polygon_px=rect_px,
+                polygon_m=rect_metric,
+            )
+        )
+
+    total_watts = sum(p.spec.watt for p in placements)
+    panel_area_m2 = sum(p.spec.area_m2 for p in placements)
+    return OrientationSummary(orientation_label, orientation_label, placements, total_watts, panel_area_m2)
+
+
 def place_panels(
     polygon: Polygon,
     specs: Sequence[PanelSpec],
     mpp: float,
     orientation_mode: str,
     max_count: Optional[int],
-) -> Tuple[str, List[FallbackPanelPlacement]]:
-    orientations: Iterable[str]
-    if orientation_mode == "auto":
-        orientations = ("portrait", "landscape")
-    else:
-        orientations = (orientation_mode,)
+) -> Dict[str, OrientationSummary]:
+    polygon_m = affinity.scale(polygon, xfact=mpp, yfact=mpp, origin=(0.0, 0.0))
+    axis_angle = principal_axis_angle(polygon_m)
 
-    best_orientation = "portrait"
-    best_placements: List[FallbackPanelPlacement] = []
-    best_watts = -1.0
+    portrait = _layout_for_orientation(
+        polygon,
+        polygon_m,
+        axis_angle,
+        specs,
+        max_count,
+        "portrait",
+        mpp,
+    )
+    landscape = _layout_for_orientation(
+        polygon,
+        polygon_m,
+        axis_angle,
+        specs,
+        max_count,
+        "landscape",
+        mpp,
+    )
 
-    for orientation in orientations:
-        placements: List[FallbackPanelPlacement] = []
-        remaining = max_count if max_count is not None else math.inf
-        bounds = polygon.bounds
-        if not math.isfinite(bounds[0]):
-            continue
+    auto_base = portrait if portrait.total_watts >= landscape.total_watts else landscape
+    auto_summary = OrientationSummary(
+        mode="auto",
+        orientation_label=auto_base.orientation_label,
+        placements=list(auto_base.placements),
+        total_watts=auto_base.total_watts,
+        panel_area_m2=auto_base.panel_area_m2,
+    )
 
-        for spec in sorted(specs, key=lambda s: (s.watt / max(s.area_m2, 1e-6), s.area_m2), reverse=True):
-            panel_w_m, panel_h_m = (
-                (spec.width_m, spec.height_m)
-                if orientation == "portrait"
-                else (spec.height_m, spec.width_m)
-            )
-            panel_gap = spec.gap_m
-            panel_w_px = panel_w_m / mpp
-            panel_h_px = panel_h_m / mpp
-            gap_px = panel_gap / mpp
-            step_x = panel_w_px + gap_px
-            step_y = panel_h_px + gap_px
-            half_w = panel_w_px / 2.0
-            half_h = panel_h_px / 2.0
-            if step_x <= 0 or step_y <= 0:
-                continue
-
-            minx, miny, maxx, maxy = polygon.bounds
-            offset_x_values = [0.0, step_x / 2.0]
-            offset_y_values = [0.0, step_y / 2.0]
-
-            best_local: List[Polygon] = []
-            for ox in offset_x_values:
-                for oy in offset_y_values:
-                    current: List[Polygon] = []
-                    y = miny + half_h + oy
-                    while y + half_h <= maxy + 1e-6:
-                        x = minx + half_w + ox
-                        while x + half_w <= maxx + 1e-6:
-                            rect = box(x - half_w, y - half_h, x + half_w, y + half_h)
-                            if not rect.within(polygon):
-                                x += step_x
-                                continue
-                            if any(rect.intersects(existing) for existing in current):
-                                x += step_x
-                                continue
-                            current.append(rect)
-                            if len(current) >= remaining:
-                                break
-                            x += step_x
-                        if len(current) >= remaining:
-                            break
-                        y += step_y
-                    if len(current) > len(best_local):
-                        best_local = current
-            for rect in best_local:
-                placements.append(FallbackPanelPlacement(spec=spec, rectangle=rect))
-                remaining -= 1
-                if remaining <= 0:
-                    break
-            if remaining <= 0:
-                break
-
-        total_watts = sum(p.spec.watt for p in placements)
-        if total_watts > best_watts:
-            best_watts = total_watts
-            best_orientation = orientation
-            best_placements = placements
-
-    return best_orientation, best_placements
+    return {"portrait": portrait, "landscape": landscape, "auto": auto_summary}
 
 
 def encode_image(image: Image.Image) -> str:
@@ -544,33 +663,39 @@ def _image_to_png_bytes(image: Image.Image) -> bytes:
     return buffer.getvalue()
 
 
-def draw_result(
-    image: np.ndarray,
+def render_layout_overlay(
+    image_size: Tuple[int, int],
     roof_polygon: Polygon,
     placements: Sequence[FallbackPanelPlacement],
-    fill_roof: bool = True,
-) -> str:
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    pil_image = Image.fromarray(rgb).convert("RGBA")
-    overlay = Image.new("RGBA", pil_image.size, (0, 0, 0, 0))
+) -> Image.Image:
+    width, height = image_size
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, "RGBA")
 
     roof_coords = [(float(x), float(y)) for x, y in roof_polygon.exterior.coords]
-    roof_fill = (0, 255, 255, int(0.3 * 255)) if fill_roof else None
-    roof_outline = (0, 255, 255, 200)
-    if fill_roof:
-        draw.polygon(roof_coords, fill=roof_fill)
-    draw.line(roof_coords + [roof_coords[0]], fill=roof_outline, width=2)
+    if roof_coords:
+        fill_color = (0, 255, 255, int(0.25 * 255))
+        outline_color = (0, 255, 255, 255)
+        draw.polygon(roof_coords, fill=fill_color)
+        draw.line(roof_coords + [roof_coords[0]], fill=outline_color, width=2)
 
-    panel_fill = (255, 255, 255, 230)
+    panel_fill = (255, 255, 255, 255)
     panel_outline = (255, 0, 0, 255)
     for placement in placements:
-        coords = [(float(x), float(y)) for x, y in placement.rectangle.exterior.coords]
+        coords = [(float(x), float(y)) for x, y in placement.polygon_px.exterior.coords]
         draw.polygon(coords, fill=panel_fill)
         draw.line(coords + [coords[0]], fill=panel_outline, width=1)
 
-    combined = Image.alpha_composite(pil_image, overlay)
-    return encode_image(combined.convert("RGB"))
+    return overlay
+
+
+def draw_result(
+    image_size: Tuple[int, int],
+    roof_polygon: Polygon,
+    placements: Sequence[FallbackPanelPlacement],
+) -> str:
+    overlay = render_layout_overlay(image_size, roof_polygon, placements)
+    return encode_image(overlay)
 
 
 def compute_confidence(contour: np.ndarray, polygon: Polygon) -> float:
@@ -632,7 +757,12 @@ def placements_to_mix_entries(placements: Sequence[FallbackPanelPlacement]) -> L
     return entries
 
 
-def build_debug_images(mask: np.ndarray, edges: np.ndarray, rotated_polygon: Polygon) -> Dict[str, str]:
+def build_debug_images(
+    mask: np.ndarray,
+    edges: np.ndarray,
+    rotated_polygon: Polygon,
+    layout_overlays: Optional[Dict[str, Image.Image]] = None,
+) -> Dict[str, str]:
     debug_images: Dict[str, str] = {}
 
     def to_base64(img: np.ndarray) -> str:
@@ -647,13 +777,40 @@ def build_debug_images(mask: np.ndarray, edges: np.ndarray, rotated_polygon: Pol
     coords = [(float(x), float(y)) for x, y in rotated_polygon.exterior.coords]
     overlay.line(coords + [coords[0]], fill=(0, 255, 0), width=2)
     debug_images["rotated"] = encode_image(canvas)
+
+    if layout_overlays:
+        modes = ["portrait", "landscape", "auto"]
+        first_overlay = next((layout_overlays.get(mode) for mode in modes if layout_overlays.get(mode)), None)
+        if first_overlay is not None:
+            width = first_overlay.width
+            height = first_overlay.height
+            label_height = 24
+            combined = Image.new(
+                "RGBA",
+                (width * len(modes), height + label_height),
+                (0, 0, 0, 0),
+            )
+            font = ImageFont.load_default()
+            draw_combined = ImageDraw.Draw(combined)
+            for idx, mode in enumerate(modes):
+                image = layout_overlays.get(mode)
+                if image is None:
+                    continue
+                x_offset = idx * width
+                combined.paste(image, (x_offset, 0), image)
+                text = mode
+                text_width, text_height = draw_combined.textsize(text, font=font)
+                text_x = x_offset + (width - text_width) // 2
+                text_y = height + (label_height - text_height) // 2
+                draw_combined.text(
+                    (text_x, text_y),
+                    text,
+                    fill=(255, 255, 255, 255),
+                    font=font,
+                )
+            debug_images["layouts"] = encode_image(combined)
+
     return debug_images
-
-
-def cv_matrix_to_shapely(matrix: np.ndarray) -> Tuple[float, float, float, float, float, float]:
-    a, b, tx = matrix[0]
-    c, d, ty = matrix[1]
-    return (a, b, c, d, tx, ty)
 
 
 def run_fallback_detection(
@@ -673,9 +830,7 @@ def run_fallback_detection(
             "message": "屋根を特定できませんでした。",
         }
 
-    rotated_polygon = analysis.rotated_polygon
     original_polygon = analysis.original_polygon
-    component = analysis.component_contour
     mpp = analysis.mpp
     orientation = analysis.orientation
     sharpened = analysis.sharpened_image
@@ -684,23 +839,24 @@ def run_fallback_detection(
     if max_face is not None:
         limit = min(max_total, max_face) if max_total is not None else max_face
 
-    orientation_mode = orientation_mode or "auto"
-    orientation_used, placements_rotated = place_panels(rotated_polygon, specs, mpp, orientation_mode, limit)
+    orientation_mode = (orientation_mode or "auto").lower()
+    placement_summaries = place_panels(original_polygon, specs, mpp, orientation_mode, limit)
 
-    shapely_matrix = cv_matrix_to_shapely(analysis.inverse_rotation_matrix)
-    placements: List[FallbackPanelPlacement] = []
-    for placement in placements_rotated:
-        transformed = affinity.affine_transform(placement.rectangle, shapely_matrix)
-        placements.append(FallbackPanelPlacement(spec=placement.spec, rectangle=transformed))
-
-    contour_area_px = float(cv2.contourArea(component))
-    roof_area_m2 = contour_area_px * (mpp ** 2)
-    confidence = analysis.confidence
+    selected_key = orientation_mode if orientation_mode in placement_summaries else "auto"
+    final_summary = placement_summaries[selected_key]
+    orientation_used = final_summary.orientation_label
+    placements = final_summary.placements
 
     mix_entries = placements_to_mix_entries(placements)
-    total_panels = sum(entry.count for entry in mix_entries)
-    total_watts = sum(entry.spec.watt * entry.count for entry in mix_entries)
+    total_panels = len(placements)
+    total_watts = final_summary.total_watts
     dc_kw = total_watts / 1000.0
+
+    roof_area_px = float(original_polygon.area)
+    roof_area_m2 = roof_area_px * (mpp ** 2)
+    coverage_ratio = 0.0
+    if roof_area_m2 > 0:
+        coverage_ratio = max(0.0, min(final_summary.panel_area_m2 / roof_area_m2, 1.0))
 
     roof_polygon_points = [
         [float(x), float(y)]
@@ -725,40 +881,86 @@ def run_fallback_detection(
     debug_images = None
     if debug:
         edges = cv2.Canny(analysis.rotated_mask, 50, 150)
-        debug_images = build_debug_images(analysis.rotated_mask, edges, rotated_polygon)
+        layout_overlays: Dict[str, Image.Image] = {}
+        display_size = (sharpened.shape[1], sharpened.shape[0])
+        offset_x, offset_y = analysis.crop_offset
+        translated_polygon = affinity.translate(
+            original_polygon, xoff=-offset_x, yoff=-offset_y
+        )
+        for key, summary in placement_summaries.items():
+            placements_for_mode = summary.placements
+            if offset_x != 0 or offset_y != 0:
+                placements_for_mode = [
+                    placement.translated(-offset_x, -offset_y, mpp)
+                    for placement in placements_for_mode
+                ]
+            layout_overlays[key] = render_layout_overlay(
+                display_size,
+                translated_polygon,
+                placements_for_mode,
+            )
+        debug_images = build_debug_images(
+            analysis.rotated_mask,
+            edges,
+            analysis.rotated_polygon,
+            layout_overlays=layout_overlays,
+        )
 
     normalized_orientation = (orientation + 180.0) % 180.0
 
     offset_x, offset_y = analysis.crop_offset
     crop_minx, crop_miny, crop_maxx, crop_maxy = analysis.crop_bounds
     display_polygon = original_polygon
-    display_placements = placements
-    display_image = sharpened
+    display_placements: List[FallbackPanelPlacement]
     if (offset_x, offset_y) != (0, 0) or (crop_minx, crop_miny) != (0, 0) or (
         crop_maxx != analysis.original_image.shape[1]
         or crop_maxy != analysis.original_image.shape[0]
     ):
         display_polygon = affinity.translate(original_polygon, xoff=-offset_x, yoff=-offset_y)
         display_placements = [
-            FallbackPanelPlacement(
-                spec=placement.spec,
-                rectangle=affinity.translate(placement.rectangle, xoff=-offset_x, yoff=-offset_y),
-            )
-            for placement in placements
+            placement.translated(-offset_x, -offset_y, mpp) for placement in placements
         ]
+    else:
+        display_polygon = original_polygon
+        display_placements = list(placements)
 
-    fill_roof = confidence >= 0.6
-    image_b64 = draw_result(display_image, display_polygon, display_placements, fill_roof=fill_roof)
+    image_size = (sharpened.shape[1], sharpened.shape[0])
+    image_b64 = draw_result(image_size, display_polygon, display_placements)
+
+    portrait_count = placement_summaries["portrait"].count
+    landscape_count = placement_summaries["landscape"].count
+    auto_count = placement_summaries["auto"].count
+
+    panel_details = [
+        PanelPlacementGeometry(
+            spec=PanelSpecInput(**placement.spec.original),
+            polygon_px=[
+                [float(x), float(y)]
+                for x, y in list(placement.polygon_px.exterior.coords)[:-1]
+            ],
+            polygon_m=[
+                [float(x), float(y)]
+                for x, y in list(placement.polygon_m.exterior.coords)[:-1]
+            ],
+        )
+        for placement in placements
+    ]
 
     result_model = FallbackPanelResult(
         orientation_used=orientation_used,
         dc_kw=round(dc_kw, 3),
         mix=mix_entries,
+        count=total_panels,
+        portrait_count=portrait_count,
+        landscape_count=landscape_count,
+        auto_count=auto_count,
+        panels=panel_details,
+        confidence=round(coverage_ratio, 3),
     )
 
     response: Dict[str, object] = {
         "roof_detected": True,
-        "confidence": round(confidence, 3),
+        "confidence": round(coverage_ratio, 3),
         "orientation_deg": round(float(normalized_orientation), 2),
         "roof_area_m2": round(roof_area_m2, 2),
         "panel_counts": total_panels,
@@ -771,9 +973,6 @@ def run_fallback_detection(
 
     if debug_images is not None:
         response["debug_images"] = debug_images
-
-    if confidence < 0.6:
-        response["fallback_reason"] = "low_confidence"
 
     return response
 

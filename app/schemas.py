@@ -80,10 +80,22 @@ class ErrorResponse(BaseModel):
     detail: str
 
 
+class PanelPlacementGeometry(BaseModel):
+    spec: PanelSpecInput
+    polygon_px: List[List[float]] = Field(default_factory=list)
+    polygon_m: List[List[float]] = Field(default_factory=list)
+
+
 class FallbackPanelResult(BaseModel):
     orientation_used: Optional[str] = None
     dc_kw: Optional[float] = None
     mix: List[PanelMixEntry] = Field(default_factory=list)
+    count: int = 0
+    portrait_count: int = 0
+    landscape_count: int = 0
+    auto_count: int = 0
+    panels: List[PanelPlacementGeometry] = Field(default_factory=list)
+    confidence: Optional[float] = None
 
 
 class RoofDetectionResponse(BaseModel):
