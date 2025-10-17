@@ -4,12 +4,14 @@ A FastAPI service intended for deployment on Cloud Run that orchestrates Google 
 
 ## Endpoints
 
+- `POST /square_image` – Returns a square Google Maps Static API satellite image as a Base64 data URI together with the resolved map center and meters-per-pixel figure.
+- `POST /layout_panels` – Packs rectangular panel specifications into provided roof polygons and returns a rendered layout image plus aggregate counts.
 - `POST /solar/design` – Accepts a design request and returns the maximum DC kW configuration, including panel mix details and a rendered PNG image encoded in Base64.
 - `GET /healthz` – Simple health probe endpoint.
 
 ## Environment
 
-Set the `GOOGLE_API_KEY` environment variable via Cloud Run or Secret Manager. The service never stores the key in source code.
+Set the `GOOGLE_MAPS_API_KEY` environment variable via Cloud Run or Secret Manager. For backwards compatibility `GOOGLE_API_KEY` is also accepted. The service never stores the key in source code.
 
 ## Running locally
 
@@ -17,7 +19,7 @@ Set the `GOOGLE_API_KEY` environment variable via Cloud Run or Secret Manager. T
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export GOOGLE_API_KEY=your-key
+export GOOGLE_MAPS_API_KEY=your-key
 uvicorn app.main:app --reload --port 8080
 ```
 

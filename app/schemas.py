@@ -12,6 +12,33 @@ class PanelSpecInput(BaseModel):
     watt: float = Field(..., gt=0, description="Panel DC watt rating")
 
 
+class SquareImageCenter(BaseModel):
+    lat: float
+    lng: float
+    zoom: float
+
+
+class SquareImageRequest(BaseModel):
+    gmaps_url: str = Field(..., min_length=1)
+    square_size_px: int = Field(640, ge=64, le=1024)
+    scale: int = Field(2, ge=1, le=4)
+    maptype: str = Field("satellite")
+
+    @validator("maptype")
+    def validate_maptype(cls, value: str) -> str:
+        allowed = {"satellite"}
+        if value not in allowed:
+            raise ValueError("maptype must be one of: satellite")
+        return value
+
+
+class SquareImageResponse(BaseModel):
+    image_data_uri: str
+    center: SquareImageCenter
+    square_size_px: int
+    meters_per_pixel: float
+
+
 class SolarDesignRequest(BaseModel):
     map_url: Optional[str] = None
     lat: Optional[float] = Field(None, description="Latitude in decimal degrees")
@@ -84,6 +111,23 @@ class PanelPlacementGeometry(BaseModel):
     spec: PanelSpecInput
     polygon_px: List[List[float]] = Field(default_factory=list)
     polygon_m: List[List[float]] = Field(default_factory=list)
+
+
+class LayoutPanelsSummaryOption(BaseModel):
+    panel: PanelSpecInput
+    count: int
+    dc_kw: float
+
+
+class LayoutPanelsSummary(BaseModel):
+    total_panels: int
+    total_kw: float
+    by_option: List[LayoutPanelsSummaryOption] = Field(default_factory=list)
+
+
+class LayoutPanelsResponse(BaseModel):
+    layout_image_data_uri: str
+    summary: LayoutPanelsSummary
 
 
 class FallbackPanelResult(BaseModel):
@@ -168,6 +212,31 @@ class LayoutOptimizeRequest(BaseModel):
     max_per_face: Optional[int] = Field(None, ge=1)
     max_total: Optional[int] = Field(None, ge=1)
     min_walkway_m: float = Field(0.4, ge=0)
+
+
+class LayoutPanelsRequest(BaseModel):
+    roofs: List[RoofFaceInput]
+    panels: List[PanelSpecInput]
+    orientation_mode: str = Field("auto", regex="^(portrait|landscape|auto)$")
+    max_total: Optional[int] = Field(None, ge=1)
+    max_per_face: Optional[int] = Field(None, ge=1)
+    min_walkway_m: float = Field(0.4, ge=0)
+
+    @validator("roofs")
+    def validate_roofs(cls, value: List[RoofFaceInput]) -> List[RoofFaceInput]:
+        if not value:
+            raise ValueError("At least one roof face must be provided")
+        if len(value) > 10:
+            raise ValueError("No more than 10 roof faces are allowed")
+        return value
+
+    @validator("panels")
+    def validate_panels(cls, value: List[PanelSpecInput]) -> List[PanelSpecInput]:
+        if not value:
+            raise ValueError("At least one panel specification must be provided")
+        if len(value) > 5:
+            raise ValueError("No more than 5 panel specifications are allowed")
+        return value
 
 
 class LayoutOptimizeResponse(BaseModel):
