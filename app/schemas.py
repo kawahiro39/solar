@@ -77,3 +77,11 @@ class SolarDesignResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+class RoofDetectionResponse(BaseModel):
+    roof_detected: bool
+    roof_area_m2: Optional[float] = None
+    roof_polygon: List[List[int]] = Field(default_factory=list)
+    image_overlay_base64: Optional[str] = None
+    message: Optional[str] = None
