@@ -28,6 +28,7 @@ class SolarDesignRequest(BaseModel):
         False,
         description="When true, always use Solar API dataLayers instead of buildingInsights",
     )
+    debug: bool = Field(False, description="When true, include debug imagery in fallback responses")
 
     @validator("panels")
     def validate_panels(cls, value: List[PanelSpecInput]) -> List[PanelSpecInput]:
@@ -79,9 +80,22 @@ class ErrorResponse(BaseModel):
     detail: str
 
 
+class FallbackPanelResult(BaseModel):
+    orientation_used: Optional[str] = None
+    dc_kw: Optional[float] = None
+    mix: List[PanelMixEntry] = Field(default_factory=list)
+
+
 class RoofDetectionResponse(BaseModel):
     roof_detected: bool
+    confidence: Optional[float] = None
+    orientation_deg: Optional[float] = None
     roof_area_m2: Optional[float] = None
-    roof_polygon: List[List[int]] = Field(default_factory=list)
-    image_overlay_base64: Optional[str] = None
+    panel_counts: Optional[int] = None
+    dc_kw: Optional[float] = None
+    roof_polygon: List[List[float]] = Field(default_factory=list)
+    result: Optional[FallbackPanelResult] = None
+    image_png_base64: Optional[str] = None
+    debug_images: Optional[Dict[str, str]] = None
+    fallback_reason: Optional[str] = None
     message: Optional[str] = None
