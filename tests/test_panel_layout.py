@@ -72,6 +72,9 @@ def test_fill_segment_prepared_polygon_stable():
     placements = list(result.placements)
 
     assert len(placements) == 4
+    assert sum(placement.polygon.area for placement in placements) == pytest.approx(
+        4 * spec.area_m2
+    )
     expected_bounds = [
         (0.5, 0.5, 1.5, 2.5),
         (3.1, 0.5, 4.1, 2.5),
