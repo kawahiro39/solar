@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from shapely import affinity
 from shapely.geometry import MultiPolygon, Polygon, box
 from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
 
 
 @dataclass
@@ -48,6 +49,7 @@ class SegmentInput:
     polygon: Polygon
     azimuth_deg: Optional[float]
     pitch_deg: Optional[float]
+    inferred_azimuth_deg: Optional[float] = None
 
 
 @dataclass
@@ -74,6 +76,8 @@ DENSITY_PROFILES: Dict[str, DensityProfile] = {
     "多め": DensityProfile(edge_margin_m=0.25, gap_extra_m=0.02),
 }
 
+MIN_GRID_STEP_M = 0.1
+
 
 class LayoutEngine:
     def __init__(
@@ -84,6 +88,7 @@ class LayoutEngine:
         min_walkway: float,
         max_total: Optional[int],
         max_per_face: Dict[int, Optional[int]],
+        rotation_override: Optional[float] = None,
     ) -> None:
         self.segments = list(segments)
         self.panel_specs = sorted(
@@ -95,6 +100,7 @@ class LayoutEngine:
         self.min_walkway = min_walkway
         self.max_total = max_total
         self.max_per_face = max_per_face
+        self.rotation_override = rotation_override
 
     def generate_layout(self, orientation: str) -> LayoutResult:
         assert orientation in {"portrait", "landscape"}
@@ -130,7 +136,14 @@ class LayoutEngine:
         if remaining_face <= 0 or remaining_total <= 0:
             return []
 
-        azimuth = segment.azimuth_deg if segment.azimuth_deg is not None else 0.0
+        azimuth = segment.azimuth_deg
+        if azimuth is None:
+            if self.rotation_override is not None:
+                azimuth = self.rotation_override
+            elif segment.inferred_azimuth_deg is not None:
+                azimuth = segment.inferred_azimuth_deg
+            else:
+                azimuth = 0.0
         rotation_angle = self._rotation_for_azimuth(azimuth)
         rotated_polygon = affinity.rotate(segment.polygon, rotation_angle, origin=(0.0, 0.0))
         margin = max(self.density.edge_margin_m, self.min_walkway)
@@ -148,8 +161,8 @@ class LayoutEngine:
             dimensions = self._panel_dimensions_for_orientation(spec, orientation)
             gap_total = spec.gap_m + self.density.gap_extra_m
             clearance = max(gap_total, 0.0) / 2.0
-            spec_step_x = dimensions[0] + gap_total
-            spec_step_y = dimensions[1] + gap_total
+            spec_step_x = max(dimensions[0] + gap_total, MIN_GRID_STEP_M)
+            spec_step_y = max(dimensions[1] + gap_total, MIN_GRID_STEP_M)
 
             candidate_sets = []
             minx, miny, maxx, maxy = available_polygon.bounds
@@ -244,6 +257,111 @@ def aggregate_mix(
     return {spec_index: count for spec_index, count in counts.items() if count > 0}
 
 
+def normalize_rotation(angle: float) -> float:
+    normalized = (angle + 180.0) % 180.0
+    if normalized > 90.0:
+        normalized -= 180.0
+    return normalized
+
+
+def infer_segment_orientation(polygon: Polygon) -> Optional[float]:
+    if polygon.is_empty:
+        return None
+    try:
+        rotated = polygon.minimum_rotated_rectangle
+    except Exception:
+        return None
+    coords = list(rotated.exterior.coords)
+    if len(coords) < 4:
+        return None
+    edges: List[Tuple[float, float]] = []
+    for idx in range(len(coords) - 1):
+        x1, y1 = coords[idx]
+        x2, y2 = coords[idx + 1]
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.hypot(dx, dy)
+        if length <= 1e-9:
+            continue
+        angle = math.degrees(math.atan2(dy, dx))
+        edges.append((length, angle))
+    if not edges:
+        return None
+    longest = max(edges, key=lambda edge: edge[0])
+    rotation = -longest[1]
+    return normalize_rotation(rotation)
+
+
+def simplify_polygon_for_layout(polygon: Polygon, tolerance: float = 0.05) -> Polygon:
+    if polygon.is_empty:
+        return polygon
+    simplified = polygon.simplify(tolerance, preserve_topology=True)
+    if simplified.is_empty or not simplified.is_valid:
+        return polygon
+    return simplified
+
+
+def determine_rotation_candidates(
+    segments: Sequence[SegmentInput],
+) -> List[Optional[float]]:
+    seen: Set[float] = set()
+    candidates: List[Optional[float]] = [None]
+
+    def add(angle: Optional[float]) -> None:
+        if angle is None:
+            return
+        normalized = normalize_rotation(angle)
+        key = round(normalized, 4)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(normalized)
+
+    add(0.0)
+    add(90.0)
+
+    dominant = _dominant_orientation(segments)
+    add(dominant)
+
+    return candidates
+
+
+def _dominant_orientation(segments: Sequence[SegmentInput]) -> Optional[float]:
+    weighted_cos = 0.0
+    weighted_sin = 0.0
+    total_weight = 0.0
+
+    for segment in segments:
+        angle = segment.azimuth_deg
+        if angle is None:
+            angle = segment.inferred_azimuth_deg
+        if angle is None:
+            continue
+        normalized = normalize_rotation(angle)
+        weight = max(segment.polygon.area, 1e-6)
+        rad = math.radians(normalized * 2.0)
+        weighted_cos += math.cos(rad) * weight
+        weighted_sin += math.sin(rad) * weight
+        total_weight += weight
+
+    if total_weight == 0.0:
+        polygons = [segment.polygon for segment in segments if not segment.polygon.is_empty]
+        if not polygons:
+            return None
+        try:
+            combined = unary_union(polygons)
+        except Exception:
+            combined = polygons[0]
+        try:
+            polygon = _ensure_polygon(combined)
+        except (TypeError, ValueError):
+            polygon = max(polygons, key=lambda poly: poly.area)
+        return infer_segment_orientation(polygon)
+
+    angle = math.degrees(0.5 * math.atan2(weighted_sin, weighted_cos))
+    return normalize_rotation(angle)
+
+
 def fill_segments(
     segments: Sequence[SegmentInput],
     specs: Sequence[PanelSpec],
@@ -252,6 +370,7 @@ def fill_segments(
     max_total: Optional[int],
     max_per_face: Dict[int, Optional[int]],
     orientation: str,
+    rotation_override: Optional[float] = None,
 ) -> LayoutResult:
     engine = LayoutEngine(
         segments=segments,
@@ -260,5 +379,6 @@ def fill_segments(
         min_walkway=min_walkway,
         max_total=max_total,
         max_per_face=max_per_face,
+        rotation_override=rotation_override,
     )
     return engine.generate_layout(orientation)
