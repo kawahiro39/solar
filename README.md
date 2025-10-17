@@ -9,6 +9,11 @@ A FastAPI service intended for deployment on Cloud Run that orchestrates Google 
 - `POST /solar/design` – Accepts a design request and returns the maximum DC kW configuration, including panel mix details and a rendered PNG image encoded in Base64.
 - `GET /healthz` – Simple health probe endpoint.
 
+## Request payload expectations
+
+- `/square_image` always responds with `image_data_uri`, `square_size_px`, and a `meters_per_pixel` (m/px) figure.
+- `/layout_panels` expects each `roofs[].polygon` entry to be supplied in metres (local X/Y space) while `panels[].w_mm`, `h_mm`, and `gap_mm` are in millimetres. `orientation_mode` accepts `auto`, `portrait`, or `landscape`, and `min_walkway_m` defaults to `0.4` when omitted. `max_total` and `max_per_face` are optional.
+
 ## Environment
 
 Set the `GOOGLE_MAPS_API_KEY` environment variable via Cloud Run or Secret Manager. For backwards compatibility `GOOGLE_API_KEY` is also accepted. The service never stores the key in source code.

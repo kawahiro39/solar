@@ -7,13 +7,16 @@ from typing import Dict, List, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-import requests
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import numpy as np
 from PIL import Image
 from shapely.geometry import Polygon
+
+from starlette import status
 
 from .fallback_roof import (
     analyze_roof,
@@ -93,6 +96,28 @@ app.add_middleware(
 logger = logging.getLogger(__name__)
 
 DEFAULT_ATTRIBUTION = ["© OpenStreetMap contributors", "Imagery © Google"]
+
+
+def _summarize_validation_errors(errors: List[Dict[str, object]]) -> str:
+    messages = []
+    for error in errors:
+        location = [str(part) for part in error.get("loc", []) if part not in {"body"}]
+        field_path = ".".join(location)
+        message = error.get("msg", "Invalid value")
+        if field_path:
+            messages.append(f"{field_path}: {message}")
+        else:
+            messages.append(str(message))
+    summary = "; ".join(messages) if messages else "リクエスト内容が不正です。"
+    return _truncate_detail(summary)
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation_error(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    detail = _summarize_validation_errors(exc.errors())
+    return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"detail": detail})
 
 
 def _truncate_detail(message: str) -> str:
