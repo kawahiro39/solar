@@ -158,9 +158,9 @@ class LayoutEngine:
         except Exception:
             prepared_polygon = available_polygon
         placements_rotated: List[Tuple[PanelSpec, Polygon]] = []
-        # Track accepted placements as both their buffered geometry and the
-        # corresponding axis-aligned bounding box expanded by the clearance.
-        inflated_records: List[Tuple[Tuple[float, float, float, float], BaseGeometry]] = []
+        # Track accepted placements by their axis-aligned bounding boxes expanded
+        # by the clearance so that collision checks can be performed efficiently.
+        inflated_records: List[Tuple[float, float, float, float]] = []
 
         def _expand_bounds(bounds: Tuple[float, float, float, float], padding: float) -> Tuple[float, float, float, float]:
             minx, miny, maxx, maxy = bounds
@@ -196,9 +196,9 @@ class LayoutEngine:
                 for offset_y in offset_options_y:
                     candidate_sets.append((offset_x, offset_y))
 
-            best_candidate: Tuple[int, List[Tuple[Polygon, BaseGeometry, Tuple[float, float, float, float]]]] = (0, [])
+            best_candidate: Tuple[int, List[Tuple[Polygon, Tuple[float, float, float, float]]]] = (0, [])
             for offset_x, offset_y in candidate_sets:
-                candidates: List[Tuple[Polygon, BaseGeometry, Tuple[float, float, float, float]]] = []
+                candidates: List[Tuple[Polygon, Tuple[float, float, float, float]]] = []
                 placed_records = list(inflated_records)
                 count = 0
                 y = miny + dimensions[1] / 2.0 + offset_y
@@ -219,13 +219,12 @@ class LayoutEngine:
                         candidate_bbox = _expand_bounds(rect.bounds, clearance)
                         if any(
                             _boxes_overlap(candidate_bbox, existing_bbox)
-                            for existing_bbox, _ in placed_records
+                            for existing_bbox in placed_records
                         ):
                             x += spec_step_x
                             continue
-                        inflated = rect.buffer(clearance, join_style=2)
-                        candidates.append((rect, inflated, candidate_bbox))
-                        placed_records.append((candidate_bbox, inflated))
+                        candidates.append((rect, candidate_bbox))
+                        placed_records.append(candidate_bbox)
                         count += 1
                         x += spec_step_x
                     y += spec_step_y
@@ -233,9 +232,9 @@ class LayoutEngine:
                     best_candidate = (count, candidates)
 
             selected = best_candidate[1]
-            for rect, inflated, bbox in selected:
+            for rect, bbox in selected:
                 placements_rotated.append((spec, rect))
-                inflated_records.append((bbox, inflated))
+                inflated_records.append(bbox)
                 remaining_face -= 1
                 remaining_total -= 1
                 if remaining_face <= 0 or remaining_total <= 0:
