@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from shapely import affinity
 from shapely.geometry import MultiPolygon, Polygon, box
 from shapely.geometry.base import BaseGeometry
+from shapely.prepared import prep
 from shapely.ops import unary_union
 
 
@@ -152,6 +153,10 @@ class LayoutEngine:
             return []
 
         available_polygon = _ensure_polygon(interior_polygon)
+        try:
+            prepared_polygon = prep(available_polygon)
+        except Exception:
+            prepared_polygon = available_polygon
         placements_rotated: List[Tuple[PanelSpec, Polygon]] = []
         inflated_shapes: List[BaseGeometry] = []
 
@@ -189,7 +194,7 @@ class LayoutEngine:
                             x + dimensions[0] / 2.0,
                             y + dimensions[1] / 2.0,
                         )
-                        if not rect.within(available_polygon):
+                        if not prepared_polygon.contains(rect):
                             x += spec_step_x
                             continue
                         inflated = rect.buffer(clearance, join_style=2)
