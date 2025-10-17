@@ -158,7 +158,26 @@ class LayoutEngine:
         except Exception:
             prepared_polygon = available_polygon
         placements_rotated: List[Tuple[PanelSpec, Polygon]] = []
-        inflated_shapes: List[BaseGeometry] = []
+        # Track accepted placements as both their buffered geometry and the
+        # corresponding axis-aligned bounding box expanded by the clearance.
+        inflated_records: List[Tuple[Tuple[float, float, float, float], BaseGeometry]] = []
+
+        def _expand_bounds(bounds: Tuple[float, float, float, float], padding: float) -> Tuple[float, float, float, float]:
+            minx, miny, maxx, maxy = bounds
+            return (minx - padding, miny - padding, maxx + padding, maxy + padding)
+
+        def _boxes_overlap(
+            box1: Tuple[float, float, float, float],
+            box2: Tuple[float, float, float, float],
+            *,
+            tolerance: float = 1e-9,
+        ) -> bool:
+            return not (
+                box1[2] < box2[0] - tolerance
+                or box1[0] > box2[2] + tolerance
+                or box1[3] < box2[1] - tolerance
+                or box1[1] > box2[3] + tolerance
+            )
 
         for spec in self.panel_specs:
             if remaining_face <= 0 or remaining_total <= 0:
@@ -177,10 +196,10 @@ class LayoutEngine:
                 for offset_y in offset_options_y:
                     candidate_sets.append((offset_x, offset_y))
 
-            best_candidate: Tuple[int, List[Tuple[Polygon, BaseGeometry]]] = (0, [])
+            best_candidate: Tuple[int, List[Tuple[Polygon, BaseGeometry, Tuple[float, float, float, float]]]] = (0, [])
             for offset_x, offset_y in candidate_sets:
-                candidates: List[Tuple[Polygon, BaseGeometry]] = []
-                placed_buffers = list(inflated_shapes)
+                candidates: List[Tuple[Polygon, BaseGeometry, Tuple[float, float, float, float]]] = []
+                placed_records = list(inflated_records)
                 count = 0
                 y = miny + dimensions[1] / 2.0 + offset_y
                 while y + dimensions[1] / 2.0 <= maxy + 1e-9:
@@ -197,12 +216,16 @@ class LayoutEngine:
                         if not prepared_polygon.contains(rect):
                             x += spec_step_x
                             continue
-                        inflated = rect.buffer(clearance, join_style=2)
-                        if not all(inflated.disjoint(existing) for existing in placed_buffers):
+                        candidate_bbox = _expand_bounds(rect.bounds, clearance)
+                        if any(
+                            _boxes_overlap(candidate_bbox, existing_bbox)
+                            for existing_bbox, _ in placed_records
+                        ):
                             x += spec_step_x
                             continue
-                        candidates.append((rect, inflated))
-                        placed_buffers.append(inflated)
+                        inflated = rect.buffer(clearance, join_style=2)
+                        candidates.append((rect, inflated, candidate_bbox))
+                        placed_records.append((candidate_bbox, inflated))
                         count += 1
                         x += spec_step_x
                     y += spec_step_y
@@ -210,9 +233,9 @@ class LayoutEngine:
                     best_candidate = (count, candidates)
 
             selected = best_candidate[1]
-            for rect, inflated in selected:
+            for rect, inflated, bbox in selected:
                 placements_rotated.append((spec, rect))
-                inflated_shapes.append(inflated)
+                inflated_records.append((bbox, inflated))
                 remaining_face -= 1
                 remaining_total -= 1
                 if remaining_face <= 0 or remaining_total <= 0:
