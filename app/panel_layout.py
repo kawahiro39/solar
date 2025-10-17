@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from shapely import affinity
 from shapely.geometry import MultiPolygon, Polygon, box
 from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
 
 
 @dataclass
@@ -318,11 +319,47 @@ def determine_rotation_candidates(
 
     add(0.0)
     add(90.0)
-    for segment in segments:
-        add(segment.azimuth_deg)
-        add(segment.inferred_azimuth_deg)
+
+    dominant = _dominant_orientation(segments)
+    add(dominant)
 
     return candidates
+
+
+def _dominant_orientation(segments: Sequence[SegmentInput]) -> Optional[float]:
+    weighted_cos = 0.0
+    weighted_sin = 0.0
+    total_weight = 0.0
+
+    for segment in segments:
+        angle = segment.azimuth_deg
+        if angle is None:
+            angle = segment.inferred_azimuth_deg
+        if angle is None:
+            continue
+        normalized = normalize_rotation(angle)
+        weight = max(segment.polygon.area, 1e-6)
+        rad = math.radians(normalized * 2.0)
+        weighted_cos += math.cos(rad) * weight
+        weighted_sin += math.sin(rad) * weight
+        total_weight += weight
+
+    if total_weight == 0.0:
+        polygons = [segment.polygon for segment in segments if not segment.polygon.is_empty]
+        if not polygons:
+            return None
+        try:
+            combined = unary_union(polygons)
+        except Exception:
+            combined = polygons[0]
+        try:
+            polygon = _ensure_polygon(combined)
+        except (TypeError, ValueError):
+            polygon = max(polygons, key=lambda poly: poly.area)
+        return infer_segment_orientation(polygon)
+
+    angle = math.degrees(0.5 * math.atan2(weighted_sin, weighted_cos))
+    return normalize_rotation(angle)
 
 
 def fill_segments(
